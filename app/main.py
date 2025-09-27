@@ -11,6 +11,7 @@ from fastapi import Query
 
 from .models import Status, PeaksBlock, Peak, PowerStatus
 from .rf_capture import CaptureService
+from pydantic import BaseModel
 
 app = FastAPI(title="Morpheus RF API", version="1.1")
 
@@ -53,6 +54,14 @@ def peaks():
 def power():
     st = service.get_power_state()
     return PowerStatus(**st)
+
+@app.get("/psd")
+def psd():
+    last = service.get_last_block()
+    if not last or "psd" not in last:
+        return JSONResponse(status_code=503, content={"detail": "Aún no hay PSD"})
+    return last["psd"]
+
 
 @app.websocket("/ws/peaks")
 async def ws_peaks(ws: WebSocket):
@@ -104,6 +113,47 @@ async def ws_power(ws: WebSocket, interval_ms: int = Query(1000, ge=200, le=1000
             await ws.send_json({"type": "error", "error": str(e)})
         except Exception:
             pass
+
+@app.websocket("/ws/psd")
+async def ws_psd(ws: WebSocket, interval_ms: int = Query(150, ge=50, le=2000)):
+    await ws.accept()
+    try:
+        last_sent_block = -1
+        while True:
+            await asyncio.sleep(interval_ms / 1000.0)
+            last = service.get_last_block()
+            if not last or "psd" not in last:
+                continue
+            if last["block_id"] == last_sent_block:
+                continue
+            payload = dict(last["psd"])
+            payload["capture_time_sec"] = last["capture_time_sec"]
+            await ws.send_json(payload)
+            last_sent_block = last["block_id"]
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        try:
+            await ws.send_json({"type": "error", "error": str(e)})
+        except Exception:
+            pass
+
+
+class BandConfig(BaseModel):
+    center_hz: float
+    sample_rate: float
+
+
+@app.post("/set_band")
+def set_band(cfg: BandConfig):
+    ok = service.set_band(cfg.center_hz, cfg.sample_rate)
+    if not ok:
+        return JSONResponse(status_code=500, content={"detail": "Error al configurar BladeRF"})
+    return {
+        "status": "ok",
+        "center_hz": cfg.center_hz,
+        "sample_rate": cfg.sample_rate,
+    }
 
 
 # ---- Estáticos en /ui ----
