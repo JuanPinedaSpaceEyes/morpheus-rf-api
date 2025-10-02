@@ -1,19 +1,21 @@
 # app/main.py
 from email.policy import default
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
 from fastapi.responses import JSONResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import asyncio
-from fastapi import Query
 
 from .models import Status, PeaksBlock, Peak, PowerStatus
 from .rf_capture import CaptureService
 from pydantic import BaseModel
 
-app = FastAPI(title="Morpheus RF API", version="1.1")
+
+from .drone_detector_bladerf import DroneDetectorBladeRF
+
+app = FastAPI(title="Morpheus RF API", version="1.2")
 
 # CORS
 app.add_middleware(
@@ -24,15 +26,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Servicio de captura
+# Servicio de captura existente
 service = CaptureService()
 service.start()
+
+# Servicio de detección de drones (hilo interno controlado por endpoints)
+drone_detector = DroneDetectorBladeRF()
 
 @app.on_event("shutdown")
 def shutdown_event():
     service.stop()
+    drone_detector.stop()
 
-# ---- API ----
+# ---- API existente ----
 @app.get("/status", response_model=Status)
 def status():
     return service.get_status()
@@ -155,6 +161,37 @@ def set_band(cfg: BandConfig):
         "sample_rate": cfg.sample_rate,
     }
 
+# ---- NUEVOS ENDPOINTS: Drone Detector (basado en bladeRF) ----
+
+class DroneSummary(BaseModel):
+    running: bool
+    mode: str
+    runtime_seconds: int
+    total_devices: int
+    drones_count: int
+    others_count: int
+    drones: list[dict]
+
+@app.get("/drone/start", tags=["drone"])
+def start_drone_detector(simulate: bool = Query(True, description="true = simulación (default), false = modo real")):
+    """
+    Arranca el detector en un hilo:
+      - simulate=true: usa flujo simulado (ideal para probar UI/flujo).
+      - simulate=false: punto de conexión para captura real (cuando conectes tu pipeline bladeRF).
+    """
+    return drone_detector.start(simulate=simulate)
+
+@app.get("/drone/stop", tags=["drone"])
+def stop_drone_detector():
+    """Detiene el hilo del detector."""
+    return drone_detector.stop()
+
+@app.get("/drone/summary", response_model=DroneSummary, tags=["drone"])
+def drone_summary():
+    """
+    Resumen compacto del detector: estado, tiempo, conteos y lista parcial de drones.
+    """
+    return drone_detector.summary()
 
 # ---- Estáticos en /ui ----
 STATIC_DIR = Path(__file__).resolve().parent / "static"
