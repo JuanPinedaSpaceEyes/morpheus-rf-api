@@ -1,14 +1,37 @@
 # app/drone_detector_bladerf.py
+"""
+Drone detector service for Morpheus RF API.
+
+Adapted from the user-provided script: keeps simulation mode and a
+'capture_cmd' hook for reading lines from an external pipeline (SoapySDR/GNU-Radio flow)
+that emits textual lines with: [timestamp] <channel> <power> <MAC> <payload>.
+
+Provides a class DroneDetectorBladeRF with methods expected by app/main.py:
+ - start(simulate: bool=True) -> dict
+ - stop() -> dict
+ - is_running() -> bool
+ - summary() -> dict
+ - save_report() -> None
+
+To run in real mode you must set the capture command either via the constructor
+or the environment variable DRONE_CAPTURE_CMD (e.g. a python script that demodulates 802.11).
+"""
+
+from __future__ import annotations
 import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from datetime import datetime
 from collections import defaultdict
-import threading
 from typing import Optional, Tuple
 
+try:
+    from tabulate import tabulate
+except Exception:
+    tabulate = None  # optional
 
 # ANSI color codes para salida opcional (consola)
 class Colors:
@@ -23,39 +46,42 @@ class Colors:
     UNDERLINE = '\033[4m'
 
 
-def bladerf_present() -> Tuple[bool, str]:
-    """Devuelve (presente, primer_renglon_salida) usando `bladeRF-cli -p`."""
+def _bladerf_probe_cli() -> Tuple[bool, str]:
+    """Simple probe for bladeRF CLI presence; used only to check device in real mode."""
+    cmd = os.getenv("BLADERF_CLI") or shutil_which("bladeRF-cli") or shutil_which("bladerf-cli")
+    if not cmd:
+        return False, "bladeRF CLI not found"
     try:
-        p = subprocess.run(
-            ["bladeRF-cli", "-p"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=5
-        )
-        if p.returncode == 0 and re.search(r"(bladeRF|nuand)", p.stdout, re.IGNORECASE):
-            first = p.stdout.splitlines()[0] if p.stdout else "device found"
-            return True, first
-        return False, p.stdout.strip() or p.stderr.strip()
+        p = subprocess.run([cmd, "-p"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=3)
+        out = (p.stdout or p.stderr or "").strip()
+        if p.returncode == 0 and ("bladeRF" in out or "nuand" in out.lower()):
+            return True, out.splitlines()[0] if out else "bladeRF present"
+        if "no devices available" in out.lower():
+            return False, "no bladeRF devices available"
+        return False, out or f"returncode={p.returncode}"
     except Exception as e:
-        return False, f"err: {e}"
+        return False, f"error: {e}"
+
+def shutil_which(name):
+    """small wrapper to avoid importing shutil globally at top-level in some contexts"""
+    try:
+        import shutil
+        return shutil.which(name)
+    except Exception:
+        return None
 
 
 class DroneDetectorBladeRF:
     """
-    Detector basado en tu script, adaptado para ejecutarse como servicio con bladeRF.
+    Detector adaptable a tu API:
 
-    Modo real:
-      - Requiere un proceso externo (pipeline) que imprima líneas con este formato:
-        [YYYY-mm-dd HH:MM:SS.mmm] <channel:int> <power:int> <MAC:AA:BB:CC:DD:EE:FF> <payload>
-      - Si tu pipeline no incluye timestamp al inicio, se le inyecta uno automáticamente.
-
-    Ejemplos de capture_cmd:
-      - "python3 /opt/flows/ieee80211_probe_stdout.py --center 2.437e9 --samp-rate 20e6"
-      - "/usr/bin/bash -lc 'mi_binario --opciones'"
+    - simulate=True: run a built-in simulator.
+    - simulate=False: runs an external capture command (DRONE_CAPTURE_CMD env var or constructor param)
+      which must output lines in the expected format; otherwise the detector will error out.
     """
+
     def __init__(self, capture_cmd: Optional[str] = None):
-        # OUIs de drones (tu lista)
+        # OUIs de drones (extend as needed)
         self.drone_ouis = {
             '60:60:1F': 'DJI Technology',
             '34:D2:62': 'DJI Technology',
@@ -64,138 +90,190 @@ class DroneDetectorBladeRF:
             '7C:E9:D3': 'DJI Technology',
             '48:1C:B9': 'DJI Technology',
             'B0:E1:C5': 'DJI Technology',
-            '00:00:00': 'G9 Drone',   # TODO: actualizar con OUI real si lo tienes
-            'AC:DE:48': 'Generic Drone Vendor',
+            '00:12:1C': 'Parrot SA',
+            '90:03:B7': 'Parrot SA',
+            '00:60:37': 'Skydio',
+        }
+
+        # OUIs comunes (no-drones) para mejor clasificación
+        self.common_ouis = {
+            '00:1B:63': 'Apple Inc.',
+            '3C:15:C2': 'Apple Inc.',
+            'AC:BC:32': 'Apple Inc.',
+            '88:66:5A': 'Apple Inc.',
+            '10:8C:CF': 'Samsung Electronics',
+            'B8:27:EB': 'Raspberry Pi Foundation',
+            'F0:D1:A9': 'Google Inc.',
+            '48:D7:05': 'Amazon Technologies',
         }
 
         self.detected_devices = defaultdict(lambda: {
             'first_seen': None,
             'last_seen': None,
             'signal_strength': [],
-            'channel': set(),
+            'frequency_or_channel': set(),
             'payload_samples': [],
             'packet_count': 0,
             'vendor': 'Unknown',
-            'is_drone': False
+            'is_drone': False,
+            'signal_type': 'Unknown'
         })
 
+        # threading/sync primitives
         self._lock = threading.RLock()
         self._thread: Optional[threading.Thread] = None
         self._running = threading.Event()
         self._simulate = True
         self.start_time: Optional[datetime] = None
 
-        # --- Nuevo: comando externo para captura real ---
-        # Prioridad: parámetro > variable de entorno > None
-        self.capture_cmd: Optional[str] = capture_cmd or os.getenv("DRONE_CAPTURE_CMD")
-        # Proceso lanzado en modo real
+        # capture command: constructor param > env var
+        self.capture_cmd = capture_cmd or os.getenv("DRONE_CAPTURE_CMD")
         self._proc: Optional[subprocess.Popen] = None
 
-    # ---------------- Lógica de parseo y actualización ----------------
+        # stats
+        self.total_packets = 0
 
-    def parse_mac_from_payload(self, payload: str):
-        mac_pattern = r'([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5})'
-        return re.findall(mac_pattern, payload)
+    # ---------------- utilities ----------------
+    def detect_signal_type(self, frequency_hz: str) -> str:
+        try:
+            freq_mhz = float(frequency_hz) / 1e6
+            if 2400 <= freq_mhz <= 2500:
+                return 'WiFi 2.4GHz/BT/Drones'
+            if 5000 <= freq_mhz <= 6000:
+                return 'WiFi 5GHz/Drones'
+            if 900 <= freq_mhz <= 928:
+                return 'ISM 900MHz/LoRa'
+            return f'Unknown ({freq_mhz:.1f}MHz)'
+        except Exception:
+            return 'Unknown'
 
-    def identify_vendor(self, mac: str):
-        oui = mac[:8].upper()
-        for drone_oui, vendor in self.drone_ouis.items():
-            if oui.startswith(drone_oui.upper()):
+    def identify_vendor(self, mac: str) -> Tuple[str, bool]:
+        oui = (mac or "")[:8].upper()
+        for d_oui, vendor in self.drone_ouis.items():
+            if oui.startswith(d_oui.upper()):
                 return vendor, True
-        return 'Unknown Vendor', False
+        for c_oui, vendor in self.common_ouis.items():
+            if oui.startswith(c_oui.upper()):
+                return vendor, False
+        return 'Unknown Device', False
 
-    def update_device(self, mac: str, channel: int, power: int, payload: str, timestamp: str):
+    # ---------------- parsing & updating ----------------
+    def parse_mac_from_payload(self, payload: str):
+        pattern = r'([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})'
+        return [m.upper() for (m,) in re.findall(pattern, payload)]
+
+    def update_device(self, mac: str, freq_or_channel: str, power: int, payload: str, timestamp: str):
         vendor, is_drone = self.identify_vendor(mac)
         with self._lock:
-            device = self.detected_devices[mac]
-            device['vendor'] = vendor
-            device['is_drone'] = is_drone
-            device['last_seen'] = timestamp
-            device['packet_count'] += 1
-            if device['first_seen'] is None:
-                device['first_seen'] = timestamp
+            self.total_packets += 1
+            d = self.detected_devices[mac]
+            d['vendor'] = vendor
+            d['is_drone'] = is_drone
+            d['last_seen'] = timestamp
+            d['packet_count'] += 1
+            if d['first_seen'] is None:
+                d['first_seen'] = timestamp
                 if is_drone:
-                    self.alert_drone_detection(mac, vendor)
-            device['channel'].add(channel)
-            device['signal_strength'].append(power)
-            if len(device['payload_samples']) < 5:
-                device['payload_samples'].append(payload[:20])
+                    self._print_alert(mac, vendor, timestamp)
+            d['frequency_or_channel'].add(freq_or_channel)
+            d['signal_strength'].append(int(power))
+            if len(d['payload_samples']) < 5 and payload:
+                d['payload_samples'].append(payload[:32])
 
-    def alert_drone_detection(self, mac: str, vendor: str):
-        # Mensaje a consola (no bloquea API)
+    def _print_alert(self, mac: str, vendor: str, timestamp: str):
         print(
-            f"\n{Colors.RED}🚁 ¡DRONE DETECTADO!{Colors.ENDC} "
+            f"\n{Colors.RED}🚁 DRONE DETECTADO{Colors.ENDC} "
             f"{Colors.YELLOW}{mac}{Colors.ENDC} "
             f"{Colors.CYAN}{vendor}{Colors.ENDC} "
-            f"{Colors.GREEN}{datetime.now().strftime('%H:%M:%S')}{Colors.ENDC}\n"
+            f"{Colors.GREEN}{timestamp}{Colors.ENDC}\n"
         )
 
     def process_capture_line(self, line: str):
+        """
+        Expected line forms:
+         - "[2025-10-02 12:10:01.123] 2437000000 -45 60:60:1F:AA:BB:CC payload..."
+         - or lines without timestamp, these will be prepended with current timestamp.
+         - older format also accepted: timestamp split in two tokens; parser is forgiving.
+        """
         try:
-            parts = line.strip().split()
-            if len(parts) >= 6:
-                # parts: [timestamp_parts] channel power mac payload
-                timestamp = parts[0] + ' ' + parts[1] if len(parts[0]) > 0 else datetime.now().strftime('[%Y-%m-%d %H:%M:%S.%f]')
-                channel = int(parts[2]) if parts[2].isdigit() else 0
-                power_level = int(parts[3]) if parts[3].isdigit() else 0
-                mac_address = parts[4]
-                payload = parts[5] if len(parts) > 5 else ''
-                if re.match(r'^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$', mac_address):
-                    self.update_device(mac_address, channel, power_level, payload, timestamp)
-                # MACs adicionales en payload
-                for mac_match in re.findall(r'([0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5})', payload):
-                    if mac_match != mac_address:
-                        self.update_device(mac_match, channel, power_level, payload, timestamp)
+            if not line:
+                return
+            s = line.strip()
+            if not s.startswith('['):
+                s = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {s}"
+
+            # split tokens after timestamp
+            # remove leading [timestamp]
+            try:
+                ts_end = s.index(']') + 1
+                ts = s[1:ts_end-1]
+                rest = s[ts_end:].strip()
+            except ValueError:
+                ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+                rest = s
+
+            parts = rest.split(None, 4)  # up to 5 parts: freq/channel, power, mac, payload...
+            if len(parts) >= 3:
+                freq_or_channel = parts[0]
+                power_s = parts[1]
+                mac_candidate = parts[2].upper()
+                payload = parts[3] if len(parts) > 3 else ''
+
+                # normalize power
+                try:
+                    power = int(re.sub(r'[^\d\-]', '', power_s))
+                except Exception:
+                    power = 0
+
+                # MAC validation
+                if re.match(r'^([0-9A-F]{2}:){5}[0-9A-F]{2}$', mac_candidate):
+                    self.update_device(mac_candidate, freq_or_channel, power, payload, ts)
+                else:
+                    # maybe MAC inside payload
+                    macs = self.parse_mac_from_payload(payload)
+                    for m in macs:
+                        self.update_device(m, freq_or_channel, power, payload, ts)
         except Exception:
-            pass
+            # keep service robust
+            return
 
-    # ---------------- Captura (simulada por defecto) ----------------
-
+    # ---------------- simulation loop ----------------
     def _simulate_loop(self):
-        sample_data = [
-            "[2022-04-29 10:41:19.840]    81  1  01:E7:E7:E7:E7  F3",
-            "[2022-04-29 10:41:19.848]    81  1  60:60:1F:AA:BB:CC  F7",  # DJI
-            "[2022-04-29 10:41:19.864]    81  1  01:E7:E7:E7:E7  FB",
-            "[2022-04-29 10:41:30.974]    82  1  34:D2:62:11:22:33  FF",  # DJI
-            "[2022-04-29 10:41:38.333]    82  1  02:E7:E7:E7:E7  FF",
-            "[2022-04-29 10:41:52.818]    82  1  AA:BB:CC:DD:EE:FF  FB",
+        devices = [
+            {'mac': '60:60:1F:AA:BB:CC', 'freq':'2437000000', 'power': -45, 'rate': 0.8},
+            {'mac': '34:D2:62:11:22:33', 'freq':'5180000000', 'power': -52, 'rate': 0.6},
+            {'mac': '3C:15:C2:A1:B2:C3', 'freq':'2437000000', 'power': -35, 'rate': 1.0},
+            {'mac': '88:66:5A:D4:E5:F6', 'freq':'5180000000', 'power': -40, 'rate': 0.9},
+            {'mac': '10:8C:CF:77:88:99', 'freq':'2462000000', 'power': -55, 'rate': 0.7},
+            {'mac': 'B8:27:EB:98:76:54', 'freq':'2437000000', 'power': -65, 'rate': 0.3},
         ]
+        import random
         idx = 0
         while self._running.is_set():
-            line = sample_data[idx % len(sample_data)]
-            line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}]" + line[line.find(']')+1:]
+            device = random.choices(devices, weights=[d['rate'] for d in devices])[0]
+            power = device['power'] + random.randint(-8, 8)
+            line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {device['freq']} {power} {device['mac']} SIMPAYLOAD"
             self.process_capture_line(line)
+            if idx % 20 == 0:
+                # keep last state printed if someone runs interactively
+                self._maybe_print_summary()
             idx += 1
-            time.sleep(0.1)
+            time.sleep(0.05)
 
-    # ---------------- Captura REAL: lee de un proceso externo ----------------
-
-    def _bladerf_capture_loop(self):
-        """
-        Ejecuta `self.capture_cmd` y lee stdout línea a línea.
-        Cada línea debe venir (o se le inyecta) en formato:
-          [timestamp] <channel> <power> <MAC> <payload>
-        """
+    # ---------------- real capture loop (external process) ----------------
+    def _capture_loop_from_cmd(self):
         if not self.capture_cmd:
-            print(f"{Colors.RED}[ERR]{Colors.ENDC} No se definió 'capture_cmd' para captura real. Usa el parámetro o DRONE_CAPTURE_CMD.")
+            print(f"{Colors.RED}[ERR]{Colors.ENDC} capture_cmd no definido. Establece DRONE_CAPTURE_CMD o pasa capture_cmd al constructor.")
             self._running.clear()
             return
 
         args = shlex.split(self.capture_cmd)
-        print(f"{Colors.CYAN}[INFO]{Colors.ENDC} Iniciando proceso de captura: {self.capture_cmd}")
-
+        print(f"{Colors.CYAN}[INFO]{Colors.ENDC} Iniciando captura externa: {self.capture_cmd}")
         try:
-            self._proc = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                bufsize=1  # line-buffered
-            )
+            self._proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
         except Exception as e:
-            print(f"{Colors.RED}[ERR]{Colors.ENDC} No pude iniciar el proceso de captura: {e}")
+            print(f"{Colors.RED}[ERR]{Colors.ENDC} No pude iniciar proceso de captura: {e}")
             self._running.clear()
-            self._proc = None
             return
 
         try:
@@ -203,21 +281,19 @@ class DroneDetectorBladeRF:
             while self._running.is_set():
                 line = self._proc.stdout.readline()
                 if not line:
-                    # Proceso terminó o no hay datos nuevos
+                    # process ended or nothing new
                     if self._proc.poll() is not None:
-                        print(f"{Colors.YELLOW}[WARN]{Colors.ENDC} Proceso de captura salió con código {self._proc.returncode}")
+                        print(f"{Colors.YELLOW}[WARN]{Colors.ENDC} Proceso de captura finalizó (code {self._proc.returncode})")
                         break
                     time.sleep(0.05)
                     continue
-
-                # Asegurar timestamp al inicio si no viene incluido
+                # ensure timestamp at start
                 s = line.strip()
                 if not s.startswith('['):
                     s = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}] {s}"
                 self.process_capture_line(s)
-
         finally:
-            # Cierre limpio del proceso si sigue vivo
+            # ensure process cleanup
             try:
                 if self._proc and self._proc.poll() is None:
                     self._proc.terminate()
@@ -229,41 +305,83 @@ class DroneDetectorBladeRF:
                 pass
             self._proc = None
 
-    # ---------------- API del servicio ----------------
+    # ---------------- printing / summary / report ----------------
+    def _maybe_print_summary(self):
+        # minimal console summary for interactive sessions
+        if tabulate is None:
+            return
+        with self._lock:
+            drones = {m:i for m,i in self.detected_devices.items() if i['is_drone']}
+            others = {m:i for m,i in self.detected_devices.items() if not i['is_drone']}
+            print(f"{Colors.HEADER}{'='*60}{Colors.ENDC}")
+            print(f"{Colors.BOLD}DroneDetector (sim={self._simulate}) running={self.is_running()}{Colors.ENDC}")
+            print(f"Total packets: {self.total_packets} Devices: {len(self.detected_devices)} Drones: {len(drones)}")
+            if drones:
+                rows = []
+                for mac, info in drones.items():
+                    avg = sum(info['signal_strength'])/len(info['signal_strength']) if info['signal_strength'] else 0
+                    rows.append([mac, info['vendor'], info['packet_count'], f"{avg:.1f}dBm", ",".join(info['frequency_or_channel'])])
+                print(tabulate(rows, headers=['MAC','Vendor','Pkts','Avg','Ch/Freq']))
+            print(f"{Colors.HEADER}{'='*60}{Colors.ENDC}")
 
+    def save_report(self) -> str:
+        """Save a compact text report and return filename."""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        filename = f"sdr_report_{timestamp}.txt"
+        try:
+            with open(filename, 'w') as f:
+                f.write("SDR SPECTRUM ANALYZER REPORT\n")
+                f.write("="*80 + "\n")
+                f.write(f"Time: {datetime.now()}\n")
+                f.write(f"Runtime: {(datetime.now() - self.start_time) if self.start_time else 0}\n")
+                f.write(f"Total packets: {self.total_packets}\n")
+                f.write(f"Total devices: {len(self.detected_devices)}\n\n")
+                drones = {mac:info for mac,info in self.detected_devices.items() if info['is_drone']}
+                f.write(f"DRONES: {len(drones)}\n")
+                f.write("-"*80 + "\n")
+                for mac, info in drones.items():
+                    avg = sum(info['signal_strength'])/len(info['signal_strength']) if info['signal_strength'] else 0
+                    f.write(f"MAC: {mac}\nVendor: {info['vendor']}\nPackets: {info['packet_count']}\nAvg signal: {avg:.1f} dBm\nChannels/freq: {','.join(info['frequency_or_channel'])}\n\n")
+            print(f"{Colors.GREEN}✓ Report saved: {filename}{Colors.ENDC}")
+            return filename
+        except Exception as e:
+            print(f"{Colors.RED}[ERR] saving report: {e}{Colors.ENDC}")
+            return ""
+
+    # ---------------- control API ----------------
     def start(self, simulate: bool = True) -> dict:
-        present, detail = bladerf_present()
-        if not simulate:
-            # En modo real exigimos hardware y comando
-            if not present:
-                msg = f"bladeRF no detectado: {detail}"
-                print(f"{Colors.RED}[ERR]{Colors.ENDC} {msg}")
-                return {"running": False, "error": msg}
-            if not self.capture_cmd:
-                msg = "capture_cmd no definido. Usa parámetro en constructor o variable DRONE_CAPTURE_CMD."
-                print(f"{Colors.RED}[ERR]{Colors.ENDC} {msg}")
-                return {"running": False, "error": msg}
-
+        """
+        Start detector in background thread.
+        If simulate is False, capture_cmd must be defined and bladeRF (or equivalent) must be present.
+        """
+        # if already running, return status
         if self._thread and self._thread.is_alive():
-            return {"running": True, "message": "Detector ya está en ejecución"}
+            return {"running": True, "message": "Detector already running", "mode": "simulation" if self._simulate else "real"}
 
-        self._simulate = simulate
+        self._simulate = bool(simulate)
+        # if real, validate presence
+        if not self._simulate:
+            # optional probe for bladeRF CLI presence
+            ok, msg = _bladerf_probe_cli()
+            if not ok:
+                return {"running": False, "error": f"bladeRF probe failed: {msg}"}
+            if not self.capture_cmd:
+                return {"running": False, "error": "capture_cmd not defined (DRONE_CAPTURE_CMD env var or constructor param)"}
+
+        # start thread
         self._running.set()
         self.start_time = datetime.now()
-
-        target = self._simulate_loop if simulate else self._bladerf_capture_loop
-        self._thread = threading.Thread(target=target, name="DroneDetectorBladeRF", daemon=True)
+        worker = self._simulate_loop if self._simulate else self._capture_loop_from_cmd
+        self._thread = threading.Thread(target=worker, name="DroneDetectorBladeRF", daemon=True)
         self._thread.start()
-        return {"running": True, "mode": "simulation" if simulate else "real"}
+        return {"running": True, "mode": "simulation" if self._simulate else "real"}
 
     def stop(self) -> dict:
         self._running.clear()
-        # Detener hilo
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+            self._thread.join(timeout=2.0)
         self._thread = None
-
-        # Detener proceso real si sigue activo
+        # ensure subprocess is terminated
         try:
             if self._proc and self._proc.poll() is None:
                 self._proc.terminate()
@@ -274,7 +392,8 @@ class DroneDetectorBladeRF:
         except Exception:
             pass
         self._proc = None
-
+        # save a report snapshot
+        self.save_report()
         return {"running": False}
 
     def is_running(self) -> bool:
@@ -282,19 +401,18 @@ class DroneDetectorBladeRF:
 
     def summary(self) -> dict:
         with self._lock:
-            runtime = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0.0
-            drones = {mac: info for mac, info in self.detected_devices.items() if info['is_drone']}
-            others = {mac: info for mac, info in self.detected_devices.items() if not info['is_drone']}
-            # Resumen compacto para API
+            runtime = (datetime.now() - self.start_time).total_seconds() if self.start_time else 0
+            drones = {mac:info for mac,info in self.detected_devices.items() if info['is_drone']}
+            others = {mac:info for mac,info in self.detected_devices.items() if not info['is_drone']}
             simple_drones = []
             for mac, info in drones.items():
-                avg_signal = (sum(info['signal_strength']) / len(info['signal_strength'])) if info['signal_strength'] else 0
+                avg = (sum(info['signal_strength'])/len(info['signal_strength'])) if info['signal_strength'] else 0
                 simple_drones.append({
                     "mac": mac,
                     "vendor": info['vendor'],
                     "packets": info['packet_count'],
-                    "avg_signal": round(avg_signal, 1),
-                    "channels": sorted(list(info['channel'])),
+                    "avg_signal": round(avg, 1),
+                    "channels": sorted(list(info['frequency_or_channel'])),
                     "last_seen": info['last_seen'],
                 })
             return {
@@ -304,5 +422,5 @@ class DroneDetectorBladeRF:
                 "total_devices": len(self.detected_devices),
                 "drones_count": len(drones),
                 "others_count": len(others),
-                "drones": simple_drones[:20],
+                "drones": simple_drones[:50],
             }

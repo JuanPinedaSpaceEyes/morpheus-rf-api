@@ -1,4 +1,4 @@
-#!/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/.venv/bin/python3
+#!/home/juan-dev/Documents/Workspace/morpheus-rf-api/.venv/bin/python
 import sys
 from dotenv.__main__ import cli
 if __name__ == '__main__':
