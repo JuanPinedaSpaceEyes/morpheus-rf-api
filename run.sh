@@ -1,10 +1,13 @@
-#!/usr/bin/env bash
-set -euo pipefail
-# activa tu venv si aplica
-# source /home/juan-dev/bladeRF/host/python/.venv/bin/activate
+#!/usr/bin/env sh
+set -eu  # (sin pipefail)
 
-# si estás en Flatpak asegúrate que BLADERF_CLI apunte al host (basename aceptable)
-# export BLADERF_CLI=/usr/local/bin/bladeRF-cli
+# activa venv si existe
+if [ -d ".venv" ]; then
+  # en sh se usa '.' en vez de 'source'
+  . ".venv/bin/activate"
+fi
 
-# arranca uvicorn
-exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+export TIMEOUT_SEC=${TIMEOUT_SEC:-10}
+export BLADERF_CLI_FORCED=${BLADERF_CLI_FORCED:-}
+
+exec python -m uvicorn app.main:app --host 0.0.0.0 --port "${PORT:-8000}" --reload

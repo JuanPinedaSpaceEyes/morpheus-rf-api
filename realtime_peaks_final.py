@@ -11,31 +11,44 @@ import time
 import shutil
 import subprocess
 import tempfile
-import signal
 from typing import List, Optional
 import numpy as np
 
 # =========================
 #     CONFIGURACIÓN
 # =========================
-RX_FREQ = 5.500e9    # Centro de todo el espectro
-SAMPLE_RATE = 20e6  # Máxima cobertura posible
+RX_FREQ = 5.500e9   # Centro de todo el espectro
+SAMPLE_RATE = 20e6  # Ancho de banda visible (fs)
 FFT_SIZE = 4096
 BLOCK_SAMPLES = 8192  # Tamaño probado que funciona
 
 # Detección de picos
-THRESH_ABOVE_MED_DB = 6.0  # dB sobre mediana (más sensible)
-MIN_SEP_HZ = 300e3  # 200 kHz separación mínima
-TOP_N = 10  # máximo picos por bloque
+THRESH_ABOVE_MED_DB = 6.0  # dB sobre mediana
+MIN_SEP_HZ = 300e3         # separación mínima entre picos
+TOP_N = 10                 # máximo picos por bloque
 
 # Control de tiempo
 UPDATE_INTERVAL_SEC = 1.0  # actualizar cada segundo
 CLI_TIMEOUT_SEC = 4.0
 
-# Configuración de visualización
-SHOW_NOISE_FLOOR = True  # mostrar información del ruido de fondo
-SHOW_BLOCK_STATS = True  # estadísticas por bloque
-COMPACT_OUTPUT = False  # salida compacta o detallada
+# Visualización consola
+SHOW_NOISE_FLOOR = True
+SHOW_BLOCK_STATS = True
+COMPACT_OUTPUT = False
+
+# =========================
+#  ESCALA DE LA PSD
+# =========================
+# Modo por defecto de salida de la PSD:
+#   - "dbfs": dBFS por bin (0 dBFS =~ potencia full-scale por bin)
+#   - "dbm" : dBm por bin ≈ dBFS + CAL_OFFSET_DB  (offset empírico)
+DEFAULT_PSD_MODE = "dbfs"   # "dbfs" | "dbm"
+
+# Offset de calibración para pasar de dBFS a dBm.
+# Mídelo una vez con generador (Pgen_dBm - medido_dBFS) y pon el valor aquí.
+CAL_OFFSET_DB = 0.0
+
+EPS = 1e-18  # Para evitar log de cero
 
 
 # =========================
@@ -136,7 +149,7 @@ class BladeRFCapture:
         """Configura el bladeRF una sola vez"""
         # Limita razonablemente (evita 300e6)
         sr = int(min(max(samplerate, 1e6), 61_440_000))  # 1 MS/s .. 61.44 MS/s aprox
-        bw = int(min(max(sr, 200_000), 56_000_000))  # BW RF ≈ SR clamped a ≤56 MHz
+        bw = int(min(max(sr, 200_000), 56_000_000))      # BW RF ≈ SR clamped a ≤56 MHz
 
         # Intenta rx1; si falla, cae a rx
         expr_rx1 = (
@@ -197,7 +210,7 @@ class BladeRFCapture:
             with open(temp_file, 'rb') as f:
                 data = f.read(expected_bytes)
 
-            # Convertir SC16 a complex64
+            # Convertir SC16 a complex64 (normalizado aprox. a ±1)
             iq = np.frombuffer(data, dtype=np.int16).astype(np.float32).reshape(-1, 2)
             samples = (iq[:, 0] + 1j * iq[:, 1]) / 2048.0
             return samples.astype(np.complex64)
@@ -214,38 +227,70 @@ class BladeRFCapture:
 # =========================
 #   PROCESADO DE SEÑAL
 # =========================
-def compute_psd(samples: np.ndarray, fft_size: int = FFT_SIZE) -> np.ndarray:
-    """PSD con ventana Hanning, potencia y notch de DC."""
-    s = samples[:fft_size] if len(samples) >= fft_size else np.pad(samples, (0, fft_size - len(samples)))
-    windowed = s * np.hanning(len(s))
-    fft = np.fft.fftshift(np.fft.fft(windowed, n=fft_size))
-    psd = 10 * np.log10(np.abs(fft)**2 + 1e-12)  # potencia en vez de módulo
-    # notch DC (bin central)
-    mid = len(psd)//2
-    med = np.median(psd)
-    psd[mid-1:mid+2] = med
-    return psd
+def _window_and_enbw(N: int):
+    """
+    Ventana Hann + métricas:
+      - cg (coherent gain), pg (power gain)
+      - ENBW en Hz (Equivalent Noise Bandwidth)
+    """
+    w = np.hanning(N).astype(np.float64)
+    cg = np.sum(w) / N
+    pg = np.sum(w ** 2) / N
+    enbw_hz = SAMPLE_RATE * (np.sum(w ** 2) / (np.sum(w) ** 2))
+    return w, cg, pg, enbw_hz
+
+
+def compute_psd(samples: np.ndarray, fft_size: int = FFT_SIZE, out: str = DEFAULT_PSD_MODE) -> np.ndarray:
+    """
+    Devuelve un espectro 'fftshift' en:
+      - 'dbfs' : dBFS por bin (normalizado por ganancia de ventana)
+      - 'dbm'  : dBm por bin ≈ dBFS + CAL_OFFSET_DB (offset empírico)
+    NOTAS:
+      * Esto es por BIN. Para PSD por Hz (dBFS/Hz o dBm/Hz) resta 10*log10(ENBW).
+      * Asume 'samples' ≈ ±1 (complex) tras normalización SC16.
+    """
+    N = int(fft_size)
+    x = samples[:N] if samples.shape[0] >= N else np.pad(samples, (0, N - samples.shape[0]))
+
+    w, cg, pg, enbw_hz = _window_and_enbw(N)
+
+    # Ventana + FFT
+    xw = x * w
+    X = np.fft.fftshift(np.fft.fft(xw, n=N))
+
+    # Potencia por bin (compensando tamaño y ventana): |FFT|^2 / (N^2 * pg)
+    psd_lin = (np.abs(X) ** 2) / (N ** 2 * pg) + EPS
+
+    # dBFS por bin
+    psd_dbfs = 10.0 * np.log10(psd_lin)
+
+    if out.lower() == "dbfs":
+        # Si quieres PSD/Hz (dBFS/Hz): psd_dbfs - 10*log10(enbw_hz)
+        return psd_dbfs.astype(np.float32)
+
+    # dBm por bin ≈ dBFS + offset empírico
+    psd_dbm = psd_dbfs + float(CAL_OFFSET_DB)
+    # Para dBm/Hz: psd_dbm - 10*log10(enbw_hz)
+    return psd_dbm.astype(np.float32)
 
 
 def find_peaks(psd: np.ndarray, fs: float, center_hz: float,
                thresh_above_med_db: float = THRESH_ABOVE_MED_DB,
                min_sep_hz: float = MIN_SEP_HZ, top_n: int = TOP_N):
-    """Encuentra picos en el espectro"""
+    """Encuentra picos en el espectro (funciona igual en dBFS o dBm)."""
     med = np.median(psd)
     threshold = med + thresh_above_med_db
 
-    # Máximos locales que superan el umbral
+    # Máximos locales sobre umbral
     locmax = np.zeros_like(psd, dtype=bool)
     locmax[1:-1] = (psd[1:-1] > psd[:-2]) & (psd[1:-1] > psd[2:]) & (psd[1:-1] >= threshold)
     idxs = np.flatnonzero(locmax)
 
     if idxs.size == 0:
-        return [], med, np.max(psd)
+        return [], med, float(np.max(psd))
 
-    # Ordenar por potencia descendente
+    # Ordenar por potencia y NMS
     idxs = idxs[np.argsort(psd[idxs])[::-1]]
-
-    # Suprimir picos cercanos (NMS)
     bins_per_hz = len(psd) / fs
     min_sep_bins = max(1, int(min_sep_hz * bins_per_hz))
     selected = []
@@ -261,20 +306,19 @@ def find_peaks(psd: np.ndarray, fs: float, center_hz: float,
         if len(selected) >= top_n:
             break
 
-    # Convertir índices a frecuencias
+    # Índices -> frecuencias absolutas
     freqs_offset = np.linspace(-fs / 2, fs / 2, len(psd), endpoint=False)
     peaks = []
     for i in selected:
         f_hz = center_hz + freqs_offset[i]
         peaks.append((float(f_hz), float(psd[i])))
 
-    # Ordenar por potencia
     peaks.sort(key=lambda x: x[1], reverse=True)
-    return peaks, med, np.max(psd)
+    return peaks, float(med), float(np.max(psd))
 
 
 # =========================
-#   VISUALIZACIÓN
+#   VISUALIZACIÓN (CLI)
 # =========================
 def format_frequency(freq_hz: float) -> str:
     """Formatea frecuencia de manera legible"""
@@ -291,26 +335,25 @@ def format_frequency(freq_hz: float) -> str:
 def print_peaks(peaks, noise_floor, max_power, block_num, capture_time):
     """Imprime los picos detectados"""
     timestamp = time.strftime("[%H:%M:%S]")
+    units = "dBFS" if DEFAULT_PSD_MODE.lower() == "dbfs" else "dBm"
 
     if COMPACT_OUTPUT:
-        # Formato compacto
         if peaks:
             freqs_str = ", ".join([format_frequency(f) for f, _ in peaks[:3]])
             print(f"{timestamp} #{block_num:4d} | {len(peaks)} picos | Top: {freqs_str}")
         else:
-            print(f"{timestamp} #{block_num:4d} | Sin picos (ruido: {noise_floor:.1f} dB)")
+            print(f"{timestamp} #{block_num:4d} | Sin picos (ruido: {noise_floor:.1f} {units})")
     else:
-        # Formato detallado
         print(f"\n{timestamp} ═══ Bloque #{block_num:4d} ═══")
         if SHOW_BLOCK_STATS:
-            print(f"Tiempo captura: {capture_time:.2f}s | Ruido: {noise_floor:.1f} dB | Máx: {max_power:.1f} dB")
+            print(f"Tiempo captura: {capture_time:.2f}s | Ruido: {noise_floor:.1f} {units} | Máx: {max_power:.1f} {units}")
 
         if peaks:
             print(f"🎯 {len(peaks)} picos detectados:")
             for i, (f, p) in enumerate(peaks, 1):
                 offset = (f - RX_FREQ) / 1e6
                 snr = p - noise_floor
-                print(f"   {i:2d}. {format_frequency(f):>12} │ {p:6.1f} dB │ SNR: {snr:5.1f} dB │ Δ{offset:+7.3f} MHz")
+                print(f"   {i:2d}. {format_frequency(f):>12} │ {p:6.1f} {units} │ SNR: {snr:5.1f} dB │ Δ{offset:+7.3f} MHz")
         else:
             print(f"💤 Sin picos sobre {THRESH_ABOVE_MED_DB} dB del ruido de fondo")
 
@@ -327,11 +370,12 @@ def main():
     # Configuración
     print(f"\n📡 Configuración:")
     print(f"   • Frecuencia central: {format_frequency(RX_FREQ)}")
-    print(f"   • Ancho de banda: {format_frequency(SAMPLE_RATE)}")
-    print(f"   • Resolución FFT: {FFT_SIZE} bins")
-    print(f"   • Umbral detección: {THRESH_ABOVE_MED_DB} dB sobre mediana")
-    print(f"   • Máximo picos: {TOP_N}")
-    print(f"   • Actualización: cada {UPDATE_INTERVAL_SEC:.1f}s")
+    print(f"   • Ancho de banda:     {format_frequency(SAMPLE_RATE)}")
+    print(f"   • Resolución FFT:     {FFT_SIZE} bins")
+    print(f"   • Umbral detección:   {THRESH_ABOVE_MED_DB} dB sobre mediana")
+    print(f"   • Máximo picos:       {TOP_N}")
+    print(f"   • Actualización:      cada {UPDATE_INTERVAL_SEC:.1f}s")
+    print(f"   • Modo PSD:           {DEFAULT_PSD_MODE.upper()}  (CAL_OFFSET_DB={CAL_OFFSET_DB:+.1f} dB)")
 
     # Inicializar capturador
     capture = BladeRFCapture()
@@ -363,7 +407,7 @@ def main():
             total_samples += len(samples)
 
             # Procesar
-            psd = compute_psd(samples, FFT_SIZE)
+            psd = compute_psd(samples, FFT_SIZE, out=DEFAULT_PSD_MODE)
             peaks, noise_floor, max_power = find_peaks(
                 psd, SAMPLE_RATE, RX_FREQ,
                 THRESH_ABOVE_MED_DB, MIN_SEP_HZ, TOP_N
@@ -376,8 +420,7 @@ def main():
             if block_count % 20 == 0:
                 elapsed = time.time() - start_time
                 rate = total_samples / elapsed / 1e6
-                print(
-                    f"\n📊 Estadísticas: {block_count} bloques, {rate:.1f} MS/s promedio, {elapsed:.0f}s transcurridos")
+                print(f"\n📊 Estadísticas: {block_count} bloques, {rate:.1f} MS/s promedio, {elapsed:.0f}s transcurridos")
 
             # Control de velocidad
             time.sleep(max(0, UPDATE_INTERVAL_SEC - capture_time))
@@ -386,9 +429,9 @@ def main():
         elapsed = time.time() - start_time
         print(f"\n\n🏁 Sesión terminada:")
         print(f"   • Bloques procesados: {block_count}")
-        print(f"   • Muestras totales: {total_samples:,}")
-        print(f"   • Tiempo total: {elapsed:.1f}s")
-        print(f"   • Tasa promedio: {total_samples / elapsed / 1e6:.1f} MS/s")
+        print(f"   • Muestras totales:   {total_samples:,}")
+        print(f"   • Tiempo total:       {elapsed:.1f}s")
+        print(f"   • Tasa promedio:      {total_samples / elapsed / 1e6:.1f} MS/s")
 
     except Exception as e:
         print(f"\n❌ Error inesperado: {e}")
