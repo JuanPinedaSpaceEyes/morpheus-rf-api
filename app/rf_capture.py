@@ -1,6 +1,7 @@
 # app/rf_capture.py
 import threading
 import time
+import numpy as np
 from typing import Optional, List, Tuple
 
 import sys, os, shutil, subprocess
@@ -132,6 +133,7 @@ class CaptureService:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
+        # Banda activa inicial (por defecto: RX_FREQ y SAMPLE_RATE)
         self.center_hz = float(RX_FREQ)
         self.sample_rate = float(SAMPLE_RATE)
 
@@ -152,15 +154,23 @@ class CaptureService:
         if self._thread:
             self._thread.join(timeout=2)
 
+    def set_band(self, center_hz: float, sample_rate: float) -> bool:
+        """Cambia la banda activa y reconfigura el BladeRF."""
+        self.center_hz = center_hz
+        self.sample_rate = sample_rate
+        self.configured = self._cap.configure(freq=center_hz, samplerate=sample_rate)
+        return self.configured
+
     def _loop(self):
+        # Configura la banda activa actual
         self.configured = self._cap.configure(freq=self.center_hz, samplerate=self.sample_rate)
         if not self.configured:
             self.last_error = "BladeRF no pudo configurarse. Revisa permisos/CLI."
             return
 
         while not self._stop.is_set():
-            t0 = time.time()
             try:
+                t0 = time.time()
                 samples = self._cap.capture_block(BLOCK_SAMPLES)
                 if samples is None or len(samples) == 0:
                     self.last_error = "Bloque vacío/None en captura"
@@ -180,6 +190,11 @@ class CaptureService:
                     "noise_floor_db": float(noise_floor),
                     "max_power_db": float(max_power),
                     "peaks": [(float(f), float(p)) for (f, p) in peaks],
+                    "psd": {
+                        "start_hz": float(self.center_hz - self.sample_rate / 2),
+                        "bin_hz": float(self.sample_rate / FFT_SIZE),
+                        "bins": np.asarray(psd, dtype=np.float32).tolist(),
+                    },
                 }
                 self.last_error = None
 
@@ -187,13 +202,30 @@ class CaptureService:
                 self.last_error = str(e)
                 time.sleep(0.2)
 
-    # helpers para FastAPI
     def get_status(self):
         return dict(
             configured=self.configured,
             blocks_processed=self.block_id,
             sample_rate_hz=self.sample_rate,
             center_freq_hz=self.center_hz,
+            last_error=self.last_error,
+        )
+
+    def get_last_block(self):
+        return self.last_block
+
+    def get_power_state(self) -> dict:
+        return probe_power_state()
+
+    # helpers para FastAPI
+    def get_status(self):
+        # Usa la banda actual (self.band_index)
+        band = self.scan_bands[self.band_index]
+        return dict(
+            configured=self.configured,
+            blocks_processed=self.block_id,
+            sample_rate_hz=band["sample_rate"],
+            center_freq_hz=band["center_hz"],
             last_error=self.last_error,
         )
 
