@@ -21,7 +21,7 @@ from torchaudio.transforms import Spectrogram
 # -----------------------------
 SAVE_PLOTS = os.getenv("PIPELINE_SAVE_PLOTS", "1") == "1"
 PLOT_DIR = Path(
-    os.getenv("PIPELINE_PLOT_DIR", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots"))
+    os.getenv("PIPELINE_PLOT_DIR", "/Users/eduarp/Documents/WorkSpace/morpheus-rf-api/plots"))
 if SAVE_PLOTS:
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -29,8 +29,8 @@ IN_CHANNELS = 2
 NUM_CLASSES = 2
 
 # --- RUTA DEL SCALER (robusta por env, con fallback al lado del script) ---
-DEFAULT_SCALER = Path(__file__).resolve().parent / "scaler.save"
-SCALER_PATH = Path(os.getenv("SCALER_PATH", str(DEFAULT_SCALER))).resolve()
+# DEFAULT_SCALER = Path(__file__).resolve().parent / "scaler.save"
+# SCALER_PATH = Path(os.getenv("SCALER_PATH", str(DEFAULT_SCALER))).resolve()
 
 # --- Apertura robusta del bladeRF ---
 os.environ.setdefault("LIBUSB_DEBUG", "3")
@@ -112,7 +112,9 @@ convnext_tiny_model = ConvNeXtTinyFineTuner(pretrained=True, in_channels=IN_CHAN
 MODEL_WEIGHTS = os.getenv("MODEL_WEIGHTS", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/models/best_state.pth")
 convnext_tiny_model.load_state_dict(torch.load(MODEL_WEIGHTS, weights_only=True, map_location=torch.device('cpu')))
 convnext_tiny_model.eval()
-print(convnext_tiny_model)
+
+
+# print(convnext_tiny_model)
 
 
 class transform_spectrogram(torch.nn.Module):
@@ -178,7 +180,7 @@ def visualize_spectrogram(spectrogram: torch.Tensor, label: float, time_duration
     """
     ch_names = {0: "I", 1: "Q"}
 
-    print(f"Spectrogram shape: {spectrogram.shape}")
+    # print(f"Spectrogram shape: {spectrogram.shape}")
     # rint(f"Label: {label}")
 
     # Convert to numpy for matplotlib
@@ -220,7 +222,6 @@ def visualize_spectrogram(spectrogram: torch.Tensor, label: float, time_duration
 
     fig.suptitle(f'Spectrogram')
     plt.tight_layout()
-    plt.show()
 
     # Print statistics if requested (ignoring NaN values)
     # Check for NaN values
@@ -238,18 +239,19 @@ def visualize_spectrogram(spectrogram: torch.Tensor, label: float, time_duration
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         out_path = PLOT_DIR / f"spectrogram_{ts}.png"
         plt.savefig(out_path, dpi=120)
-        print(f"[pipeline] saved_plot={out_path}")
-
+        # print(f"[pipeline] saved_plot={out_path}")
+    plt.show()
     # En modo headless cerramos siempre (evita warning de FigureCanvasAgg)
     plt.close(fig)
 
 
 # --- Usar la instancia 'sdr' ya creada arriba (no re-abrir de nuevo) ---
-rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(1))  # RX 1
+rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(1))  # RX 2
 
 # Configs
 sample_rate = 40e6
-center_freq = 2455500000
+center_freq = 2400000000
+step_freq = 20000000  # 20MHz
 gain = 30  # -15 a 60 dB
 num_samples = int(3e6)  # hop_lenght
 
@@ -260,7 +262,7 @@ rx_ch.gain_mode = _bladerf.GainMode.Manual
 rx_ch.gain = gain
 
 # Setup synchronous stream
-sdr.sync_config(layout=_bladerf.ChannelLayout.RX_X1,  # o RX_X2
+sdr.sync_config(layout=_bladerf.ChannelLayout.RX_X2,  # o RX_X2
                 fmt=_bladerf.Format.SC16_Q11,  # int16s
                 num_buffers=16,
                 buffer_size=8192,
@@ -273,8 +275,13 @@ buf = bytearray(1024 * bytes_per_sample)
 
 print("Starting receive")
 rx_ch.enable = True
+direction = 1
+
+min_freq = 2400000000
+max_freq = 2480000000
 
 while True:
+    print("Frecuencia central: ", center_freq)
     x = np.zeros(num_samples, dtype=np.complex64)  # storage for IQ samples
     num_samples_read = 0
     while True:
@@ -299,10 +306,10 @@ while True:
 
     # Espectrogramas
 
-    if not SCALER_PATH.exists():
-        print(f"[pipeline] No encontré scaler en: {SCALER_PATH}")
-        sys.exit(3)
-    scaler = joblib.load(str(SCALER_PATH))
+    # if not SCALER_PATH.exists():
+    #    print(f"[pipeline] No encontré scaler en: {SCALER_PATH}")
+    #    sys.exit(3)
+    # scaler = joblib.load(str(SCALER_PATH))
 
     sample_rate_down = sample_rate / 1
     transform = transform_spectrogram(
@@ -317,23 +324,39 @@ while True:
         onesided=False
     )
     spec = transform(sample)
+    spectrogram_np = spec.detach().cpu().numpy()
+    std = np.nanstd(spectrogram_np)
+
+    if center_freq >= max_freq:
+        center_freq = max_freq
+        direction = -1
+    elif center_freq <= min_freq:
+        center_freq = min_freq
+        direction = 1
+
+    if (std < 1.2):
+        center_freq += direction * step_freq
+        rx_ch.frequency = center_freq
+        continue
 
     # --- PREPROCESAMIENTO: redimensionar ANTES del scaler ---
     original_shape = spec.shape
-    print(spec.shape)
+    # print(spec.shape)
 
-    sample_reshaped = spec.reshape(1, -1).numpy()
-    print(sample_reshaped.shape)
-    sample_scaled = scaler.transform(sample_reshaped)
-    spec = torch.tensor(sample_scaled, dtype=torch.float32).view(1, 2,1024,1024)
+    # sample_reshaped = spec.reshape(1, -1).numpy()
+    # print(sample_reshaped.shape)
+    # sample_scaled = scaler.transform(sample_reshaped)
+    spec = torch.tensor(spec, dtype=torch.float32).view(1, 2, 1024, 1024)
 
-    print("sample_shape: ", spec.shape)
+    # print("sample_shape: ", spec.shape)
 
     logit = convnext_tiny_model(spec)
     prob = torch.sigmoid(logit)
     pred = (prob > 0.5).float()
     print(f"{pred=}, {prob=}")
-
+    if pred == 0:
+        center_freq += direction * step_freq
+        rx_ch.frequency = center_freq
     visualize_spectrogram(
         spectrogram=spec.view(original_shape),
         label=f"{pred} {prob}"
