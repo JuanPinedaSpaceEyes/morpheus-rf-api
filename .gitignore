@@ -16,3 +16,6 @@ EOF
 
 git add .gitignore
 git commit -m "chore: ignore venv, caches y modelos pesados"
+
+.idea/
+__pycache__/
