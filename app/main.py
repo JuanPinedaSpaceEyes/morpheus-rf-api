@@ -8,14 +8,14 @@ from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 import asyncio
 
-from .models import Status, PeaksBlock, Peak, PowerStatus
-from .rf_capture import CaptureService
+from models.models import Status, PeaksBlock, Peak, PowerStatus
+from util.rf_capture import CaptureService
 from pydantic import BaseModel
 
 
-from .drone_detector_bladerf import DroneDetectorBladeRF
-from .pipeline_router import router as pipeline_router
-from .inference_router import router as inference_router
+from util.drone_detector_bladerf import DroneDetectorBladeRF
+from routers.pipeline_router import router as pipeline_router
+from routers.inference_router import router as inference_router
 
 try:
     from dotenv import load_dotenv
