@@ -1,21 +1,14 @@
 # app/main.py
-from email.policy import default
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Query
-from fastapi.responses import JSONResponse, RedirectResponse
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from pathlib import Path
-import asyncio
 
-from models.models import Status, PeaksBlock, Peak, PowerStatus
-from util.rf_capture import CaptureService
-from pydantic import BaseModel
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 
-
-from util.drone_detector_bladerf import DroneDetectorBladeRF
-from routers.pipeline_router import router as pipeline_router
-from routers.inference_router import router as inference_router
+from app.routers.inference_router import router as inference_router
+from app.routers.pipeline_router import router as pipeline_router
+from app.routers.spectrum_router import router as spectrum_router
+from app.routers.realtime_peaks_router import router as realtime_peaks_router
 
 try:
     from dotenv import load_dotenv
@@ -26,6 +19,8 @@ except Exception:
 app = FastAPI(title="Morpheus RF API", version="1.2")
 app.include_router(inference_router, prefix="/pipelineInference", tags=["pipelineInference"])
 app.include_router(pipeline_router, prefix="/pipeline", tags=["pipeline"])
+app.include_router(spectrum_router)
+app.include_router(realtime_peaks_router)
 
 # CORS
 app.add_middleware(

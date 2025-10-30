@@ -20,7 +20,7 @@ router = APIRouter()
 # ----------------------------
 # Config: rutas de artefactos
 # ----------------------------
-DEFAULT_WEIGHTS = Path(__file__).resolve().parent.parent / "models" / "best_state.pth"
+DEFAULT_WEIGHTS = "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/models/best_state.pth"
 MODEL_WEIGHTS = Path(os.getenv("MODEL_WEIGHTS", str(DEFAULT_WEIGHTS))).resolve()
 DEFAULT_SCALER = Path(__file__).resolve().parent.parent / "scaler.save"
 SCALER_PATH = Path(os.getenv("SCALER_PATH", str(DEFAULT_SCALER))).resolve()

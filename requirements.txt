@@ -8,3 +8,5 @@ scikit-learn
 matplotlib
 torch
 torchvision
+h5py
+websockets

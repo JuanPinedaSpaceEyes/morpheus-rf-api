@@ -21,7 +21,7 @@ from torchaudio.transforms import Spectrogram
 # -----------------------------
 SAVE_PLOTS = os.getenv("PIPELINE_SAVE_PLOTS", "1") == "1"
 PLOT_DIR = Path(
-    os.getenv("PIPELINE_PLOT_DIR", "/Users/eduarp/Documents/WorkSpace/morpheus-rf-api/plots"))
+    os.getenv("PIPELINE_PLOT_DIR", ""))
 if SAVE_PLOTS:
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
