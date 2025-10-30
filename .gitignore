@@ -19,4 +19,4 @@ git commit -m "chore: ignore venv, caches y modelos pesados"
 
 .idea/
 __pycache__/
-mat_files
+mat_files/
