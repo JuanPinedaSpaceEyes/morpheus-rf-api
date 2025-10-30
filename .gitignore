@@ -1,5 +1,3 @@
-cat >> .gitignore << 'EOF'
-# Python
 .venv/
 venv/
 __pycache__/
@@ -7,16 +5,17 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-
-# Modelos / binarios pesados
-models/*.pth
-models/*.pt
-models/*.pkl
-EOF
-
-git add .gitignore
-git commit -m "chore: ignore venv, caches y modelos pesados"
-
-.idea/
-__pycache__/
+models/
+models/*
+*.pth
+*.pt
+*.pkl
 mat_files/
+*.mat
+*.dat
+*.bin
+*.iq
+plots/
+.env
+.env.*
+.idea/
