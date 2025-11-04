@@ -1,0 +1,17 @@
+version: '3.9'
+
+services:
+  morpheus-rf-api:
+    build: .
+    container_name: morpheus_rf_api
+    ports:
+      - "8000:8000"
+    devices:
+      - "/dev/bus/usb:/dev/bus/usb"
+    env_file:
+      - .env.docker
+    volumes:
+      - ./models:/app/models
+      - ./plots:/app/plots
+      - ./scaler.save:/app/scaler.save
+    restart: unless-stopped
