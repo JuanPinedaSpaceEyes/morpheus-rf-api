@@ -201,8 +201,17 @@ while True:
         rx_ch.frequency = center_freq
         continue
 
-    # --- Inferencia ---
-    spec = torch.tensor(spec, dtype=torch.float32).view(1, 1, 1024, 1024)
+    spec = spec.clone().detach().float()
+
+    if spec.ndim == 3:
+        spec = spec.unsqueeze(0)  
+    elif spec.ndim == 2:
+        spec = spec.unsqueeze(0).unsqueeze(0)  
+
+    spec = torch.nn.functional.interpolate(
+        spec, size=(1024, 1024), mode="bilinear", align_corners=False
+    )
+
     with torch.no_grad():
         output = model(spec)
         prob = torch.sigmoid(output)
