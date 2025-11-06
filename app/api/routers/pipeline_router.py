@@ -8,10 +8,10 @@ import subprocess, os, time, io, threading, signal
 from fastapi.responses import PlainTextResponse
 
 
-router = APIRouter()
+router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
 # ---------- Config ----------
-PIPELINE_PATH = Path(__file__).resolve().parent.parent / "pipeline.py"
+PIPELINE_PATH = Path(__file__).resolve().parents[2] / "ml" / "pipeline.py"
 LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "/tmp/morpheus_pipeline"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 CWD = Path(os.getenv("PIPELINE_CWD", str(PIPELINE_PATH.parent)))
@@ -118,7 +118,7 @@ def status_get():
     return _status()
 
 @router.get("/logs", tags=["pipeline"], response_class=PlainTextResponse)
-def logs_get(tail_kb: int = Query(64, ge=1, le=1024)):
+def logs_get(tail_kb: int = Query(1024, ge=1, le=1024)):
     if not state.log_file:
         return PlainTextResponse("")
     return PlainTextResponse(_tail_log(state.log_file, tail_kb))

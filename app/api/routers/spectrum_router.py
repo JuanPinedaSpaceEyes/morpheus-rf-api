@@ -21,7 +21,7 @@ async def ws_psd(ws: WebSocket):
         drone_id = qp.get("drone") or ms.DEFAULT_DRONE_ID
         fps = int(qp.get("fps") or os.getenv("STREAM_FPS", "15"))
         if not drone_id or drone_id not in ms.DRONES:
-            await ws.send_text(json.dumps({"error": "Dron no disponible. Usa ?drone=<id> o POST /spectrum/select-drone"}))
+            await ws.send_text(json.dumps({"error": "Dron no disponible"}))
             await ws.close()
             return
 

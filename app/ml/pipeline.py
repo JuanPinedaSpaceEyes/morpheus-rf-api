@@ -11,10 +11,9 @@ from datetime import datetime
 from torchaudio.transforms import Spectrogram
 import time
 
-
-
 SAVE_PLOTS = os.getenv("PIPELINE_SAVE_PLOTS", "1") == "1"
-PLOT_DIR = Path(os.getenv("PIPELINE_PLOT_DIR", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots"))
+PLOT_DIR = Path(
+    os.getenv("PIPELINE_PLOT_DIR", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots"))
 if SAVE_PLOTS:
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -40,7 +39,6 @@ except _bladerf.NoDevError:
         print("[pipeline] No pude ejecutar bladeRF-cli -p:", e)
     sys.exit(2)
 
-
 # -----------------------------
 # Carga del modelo trazado TorchScript
 # -----------------------------
@@ -60,16 +58,16 @@ except Exception as e:
 # -----------------------------
 class transform_spectrogram(torch.nn.Module):
     def __init__(
-        self,
-        device,
-        n_fft=1024,
-        win_length=1024,
-        hop_length=2930,
-        window_fn=torch.hann_window,
-        power=None,
-        normalized=False,
-        center=False,
-        onesided=False
+            self,
+            device,
+            n_fft=1024,
+            win_length=1024,
+            hop_length=2930,
+            window_fn=torch.hann_window,
+            power=None,
+            normalized=False,
+            center=False,
+            onesided=False
     ):
         super().__init__()
         self.spec = Spectrogram(
@@ -85,60 +83,96 @@ class transform_spectrogram(torch.nn.Module):
         spec = self.spec(iq_signal)
         spec = torch.view_as_real(spec)
         spec = torch.moveaxis(spec, 2, 0)
-        spec = 10 * torch.log10(spec ** 2 + self.epsilon)
-        spec = np.sqrt(spec[0]**2 + spec[1]**2)
+        spec = torch.sqrt(spec[0, :, :] ** 2 + spec[1, :, :] ** 2)
+        spec = 10 * torch.log10(spec + self.epsilon)
         return spec
 
 
 # -----------------------------
 # Visualización
 # -----------------------------
-def visualize_spectrogram(
-    spectrogram: torch.Tensor,
-    label: float,
-    time_duration: float = 75e-3,
-    n_fft=1024,
-    win_length=1024,
-    hop_length=2930,
-    sample_freq=40e6,
-    show_stats: bool = True,
-    figsize: tuple = (16, 4)
-) -> None:
-    ch_names = {0: "Signal"}
-    spectrogram_np = spectrogram.detach().cpu().numpy()
-    n_freq_bins = spectrogram_np.shape[1]
-    n_time_bins = spectrogram_np.shape[2]
+def visualize_spectrogram(spectrogram: torch.Tensor, class_name: torch.Tensor, time_duration: float = 75e-3,
+                          n_fft=1024, win_length=1024, hop_length=1024, sample_freq=40e6,
+                          show_stats: bool = True, figsize: tuple = (16, 4)) -> None:
+    """
+    Visualize a spectrogram with I and Q channels.
 
-    time_per_fft = hop_length / sample_freq
-    time_axis = np.arange(n_time_bins) * time_per_fft
-    time_duration_ms = time_axis * 1000
+    Args:
+        spectrogram: Input spectrogram tensor of shape (channels, freq_bins, time_bins)
+        label: Label tensor for the spectrogram
+        sampling_rate: Sampling rate in Hz
+        show_stats: Whether to print statistics
+        figsize: Figure size tuple (width, height)
+    """
+    if spectrogram.ndim != 3 or spectrogram.shape[0] < 2:
+        ch_names = {0: f"Power Spectrogram - {class_name}"}
+        fig, axes = plt.subplots(1, 1, figsize=figsize)
+        axes = [axes]  # Make it iterable
+    elif spectrogram.shape[0] >= 2:
+        ch_names = {0: "I Spectrogram", 1: "Q Spectrogram"}
+        fig, axes = plt.subplots(1, 2, figsize=figsize)
+        fig.suptitle(f'{class_name}')
+    else:
+        raise ValueError("Spectrogram shape {spectrogram.shape} doesnt match expected dimensions")
+
+    print(f"Spectrogram shape: {spectrogram.shape}")
+    print(f"Class: {class_name}")
+
+    # Convert to numpy for matplotlib
+    spectrogram_np = spectrogram.detach().cpu().numpy()
+
+    # Get actual dimensions from the spectrogram
+    n_freq_bins = spectrogram_np.shape[1]  # Frequency bins
+    n_time_bins = spectrogram_np.shape[2]  # Time bins
+
+    # Create time axis based on actual number of time bins
+    time_per_fft = hop_length / sample_freq  # Time per FFT in seconds
+    time_axis = np.arange(n_time_bins) * time_per_fft  # Match actual time bins
+    time_duration_ms = time_axis * 1000  # Convert to ms
+
+    # Create frequency axis
     freqs = sample_freq / win_length * np.arange(-n_fft / 2, n_fft / 2)
     freqs_in_mhz = freqs / 1e6
 
-    if len(freqs_in_mhz) > n_freq_bins:
-        freqs_in_mhz = freqs_in_mhz[:n_freq_bins]
+    # # Ensure frequency axis matches spectrogram dimensions
+    # if len(freqs_in_mhz) > n_freq_bins:
+    #     freqs_in_mhz = freqs_in_mhz[:n_freq_bins]
 
-    t = time_duration_ms
-    f = freqs_in_mhz
+    t = time_duration_ms  # Time in milliseconds
+    f = freqs_in_mhz  # Frequency in MHz
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
-    for ch in range(min(2, spectrogram_np.shape[0])):
+    # Create visualization
+    for ch in range(spectrogram_np.shape[0]):
+        # Use imshow instead of pcolormesh (much faster!)
         im = axes[ch].imshow(
             spectrogram_np[ch],
             aspect='auto',
             origin='lower',
             extent=[t[0], t[-1], f[0], f[-1]],
-            interpolation='nearest'
+            interpolation='nearest'  # or 'bilinear' for smoother look
         )
         axes[ch].set_ylabel('Frequency [MHz]')
         axes[ch].set_xlabel('Time [ms]')
-        axes[ch].set_xticks(np.arange(0, time_duration_ms[-1] if len(time_duration_ms) > 0 else 75, step=10))
-        axes[ch].set_title(f'{ch_names[ch]} Spectrogram, label:{label}')
+        # Set x-axis ticks in milliseconds
+        max_time = time_duration_ms[-1] if len(time_duration_ms) > 0 else 75
+        axes[ch].set_xticks(np.arange(0, max_time, step=10))  # every 10 ms
+        axes[ch].set_title(f'{ch_names[ch]}')
+        # axes[ch].set_ylim([0, f.max()])  # Only positive frequencies
         plt.colorbar(im, ax=axes[ch], label='Power [dB]')
 
-    fig.suptitle(f'Spectrogram')
     plt.tight_layout()
+    if SAVE_PLOTS:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        out_path = PLOT_DIR / f"spectrogram_{ts}.png"
+        plt.savefig(out_path, dpi=120)
+        print(f"[pipeline] saved_plot={out_path}")
+    plt.show()
 
+    # Print statistics if requested (ignoring NaN values)
+    # Check for NaN values
+    nan_count = np.isnan(spectrogram_np).sum()
+    total_elements = spectrogram_np.size
+    print(f"NaN values in spectrogram: {nan_count} out of {total_elements} elements")
     if show_stats:
         print(f"\nSpectrogram Statistics (NaN-ignored):")
         print(f"  Min: {np.nanmin(spectrogram_np):.2f} dB")
@@ -146,14 +180,11 @@ def visualize_spectrogram(
         print(f"  Mean: {np.nanmean(spectrogram_np):.2f} dB")
         print(f"  Std: {np.nanstd(spectrogram_np):.2f} dB")
 
-    plt.show()
-    plt.close(fig)
-
 
 # -----------------------------
 # Configuración del receptor BladeRF
 # -----------------------------
-rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(1))  # RX 2
+rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(0))  # RX 2
 
 sample_rate = 40e6
 center_freq = 2440000000
@@ -235,27 +266,20 @@ while True:
     elif center_freq <= min_freq:
         center_freq = min_freq
         direction = 1
-        if b != 1:
-            end_time2 = time.time()
-            print(f"Tiempo de realizar un ciclo: {end_time2 - start_time2:.6f} segundos")
-        b = 0
 
-    original_shape = spec.shape
     print(spec.shape)
 
-    spec = torch.tensor(spec, dtype=torch.float32).view(1, 1024, 1024)
+    spec = torch.tensor(spec, dtype=torch.float32).view(1, 1, 1024, 1024)
 
     # --- Inferencia usando el modelo trazado ---
     with torch.no_grad():
         logit = convnext_tiny_model(spec)
-        prob = torch.sigmoid(logit)
-        pred = (prob > 0.5).float()
+        prob = logit.argmax(dim=1)
 
-    print(f"{pred=}, {prob=}")
     end_time = time.time()
     print(f"Tiempo de leer y realizar el espectrograma: {end_time - start_time:.6f} segundos")
 
     visualize_spectrogram(
-        spectrogram=spec.view(original_shape),
-        label=f"{pred} {prob}"
+        spectrogram=spec.view(1, 1024, 1024),
+        class_name=f"{prob}"
     )
