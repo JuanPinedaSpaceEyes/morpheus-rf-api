@@ -355,7 +355,7 @@ def scan_dir() -> Dict[str, str]:
     return out
 
 def refresh_dir() -> None:
-    """Reescanea carpeta y mantiene DEFAULT si existe."""
+
     global DRONES, DEFAULT_DRONE_ID
     DRONES = scan_dir()
     if DEFAULT_DRONE_ID not in DRONES:
