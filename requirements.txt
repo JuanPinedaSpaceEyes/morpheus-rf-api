@@ -10,3 +10,4 @@ torch
 torchvision
 h5py
 websockets
+requests>=2.32,<3

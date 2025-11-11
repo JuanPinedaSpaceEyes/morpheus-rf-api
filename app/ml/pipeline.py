@@ -1,7 +1,6 @@
 from bladerf import _bladerf
-import numpy as np
+import numpy as np, time, math, requests
 import matplotlib.pyplot as plt
-from scipy import signal
 import torch
 import sys
 import subprocess
@@ -9,28 +8,31 @@ import os
 from pathlib import Path
 from datetime import datetime
 from torchaudio.transforms import Spectrogram
-import time
+from scipy.signal import correlate
 
-SAVE_PLOTS = os.getenv("PIPELINE_SAVE_PLOTS", "1") == "1"
-PLOT_DIR = Path(
-    os.getenv("PIPELINE_PLOT_DIR", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots"))
-if SAVE_PLOTS:
-    PLOT_DIR.mkdir(parents=True, exist_ok=True)
+# pipeline.py está en app/ml/, la raíz del proyecto es parents[2]
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
-IN_CHANNELS = 1
-NUM_CLASSES = 11
+from app.api.routers.pipeline_router import psd_hub, make_psd_frame, pred_hub
 
-# --- Apertura robusta del bladeRF ---
+INGEST_URL = os.getenv("PSD_INGEST_URL", "http://127.0.0.1:8000/pipeline/psd/ingest")
+PRED_INGEST_URL = os.getenv("PRED_INGEST_URL", "http://127.0.0.1:8000/pipeline/pred/ingest")
+# ------- Apertura robusta del bladeRF ------------------------------------------------------------------------------------------
 os.environ.setdefault("LIBUSB_DEBUG", "3")
 DEV_ID = os.getenv("BLADERF_DEVICE")
-
 try:
     if DEV_ID:
+        # Ejemplos válidos:
+        #   "*:serial=1f76c0...."
+        #   "libusb:bus=20,addr=3"
         sdr = _bladerf.BladeRF(DEV_ID)
     else:
         sdr = _bladerf.BladeRF()
 except _bladerf.NoDevError:
     print("[pipeline] No se encontraron dispositivos bladeRF desde este proceso.")
+    # Volcamos lo que ve la CLI para comparar (quedará en /pipeline/logs)
     try:
         out = subprocess.run(["bladeRF-cli", "-p"], capture_output=True, text=True)
         print("[pipeline] bladeRF-cli -p stdout:\n", out.stdout)
@@ -39,30 +41,69 @@ except _bladerf.NoDevError:
         print("[pipeline] No pude ejecutar bladeRF-cli -p:", e)
     sys.exit(2)
 
-# -----------------------------
-# Carga del modelo trazado TorchScript
-# -----------------------------
-MODEL_TRACE = "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced.pt"
+# --------- IMAGE SAVE CONFIG -------------------------------------------------------------------------------------------------------
+SAVE_PLOTS = os.getenv("PIPELINE_SAVE_PLOTS", "1") == "1"
+PLOT_DIR = Path(os.getenv("PIPELINE_PLOT_DIR", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots"))
+if SAVE_PLOTS:
+     PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ---------- Model configs------------------------------------------------------------------------------------------------------------
+dictionaryDrones = {0: 'DJI Mini 4K', 1: 'Jammer', 2: 'Noise'}
+# dictionaryDrones = {0: 'DJI Inspire 2', 1: 'DJI MINI 4K', 2: 'DJI Mavic 2 Air S', 3: 'DJI Mavic Mini', 4: 'DJI Mavic Pro', 5: 'DJI Mavic Pro 2', 6: 'DJI Phantom 4', 7: 'Noise', 8: 'Parrot Disco'}
+# dictionaryDrones = {0: 'Dron', 1: 'Noise'}
+# --------------------------------- LOAD MODEL -----------------------------------------------------------------------------------------
+IN_CHANNELS = 1
+NUM_CLASSES = 3
+
+MODEL_TRACE = "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_mc.pt"
 
 try:
-    convnext_tiny_model = torch.jit.load(MODEL_TRACE, map_location="cpu")
-    convnext_tiny_model.eval()
+    model = torch.jit.load(MODEL_TRACE, map_location="cpu")
+    model.eval()
     print(f"[pipeline] Modelo trazado cargado correctamente desde: {MODEL_TRACE}")
 except Exception as e:
     print(f"[pipeline] Error cargando modelo trazado: {e}")
     sys.exit(1)
 
 
-# -----------------------------
-# Transformador de espectrograma
-# -----------------------------
+# ---------------- FUNCIONES ------------------------------------------------------------------------------------------------------------
+
+def _compute_psd_db(x: np.ndarray, nfft: int = 4096) -> np.ndarray:
+    if x.ndim != 1:
+        raise ValueError("x debe ser 1D complejo")
+    seg = x[:nfft]
+    if seg.shape[0] < nfft:
+        seg = np.pad(seg, (0, nfft - seg.shape[0]))
+    w = np.hanning(nfft)
+    X = np.fft.fftshift(np.fft.fft(seg * w, n=nfft))
+    return 10.0 * np.log10(np.abs(X) + 1e-12)
+
+
+def publish_psd(x_complex: np.ndarray, center_hz: float, sample_rate: float, nfft: int = 4096,
+                drone_id: str | None = None):
+    psd_db = _compute_psd_db(x_complex.astype(np.complex64), nfft=nfft)
+    frame = {
+        "start_hz": float(center_hz - sample_rate / 2.0),
+        "bin_hz": float(sample_rate / nfft),
+        "bins": psd_db.astype(float).tolist(),
+        "capture_time_sec": time.time(),
+        "drone_id": drone_id,
+        "fft_size": nfft,
+        "schema_version": "1.0",
+    }
+    try:
+        requests.post(INGEST_URL, json=frame, timeout=0.7)
+    except Exception as e:
+        print("[pipeline] ingest error:", e)
+
+
 class transform_spectrogram(torch.nn.Module):
     def __init__(
             self,
             device,
-            n_fft=1024,
-            win_length=1024,
-            hop_length=2930,
+            n_fft=512,
+            win_length=512,
+            hop_length=5860,
             window_fn=torch.hann_window,
             power=None,
             normalized=False,
@@ -79,21 +120,26 @@ class transform_spectrogram(torch.nn.Module):
         self.epsilon = 1e-12
 
     def forward(self, iq_signal: torch.Tensor) -> torch.Tensor:
-        iq_signal = iq_signal[0, :] + (1j * iq_signal[1, :])
-        spec = self.spec(iq_signal)
-        spec = torch.view_as_real(spec)
-        spec = torch.moveaxis(spec, 2, 0)
-        spec = torch.sqrt(spec[0, :, :] ** 2 + spec[1, :, :] ** 2)
-        spec = 10 * torch.log10(spec + self.epsilon)
-        return spec
+        # Combinar I/Q en señal compleja
+        iq_signal = iq_signal[0, :] + 1j * iq_signal[1, :]
+        iq_signal = iq_signal - iq_signal.mean()
+        # --- Espectrograma ---
+        spec_complex = self.spec(iq_signal)
+        # spec_complex = torch.fft.fftshift(spec_complex, dim=0)
+        # `spec_complex` es complejo: separar parte real e imaginaria
+        spec_real = spec_complex.real
+        spec_imag = spec_complex.imag
+        # Calcular magnitud
+        spec_magnitude = torch.sqrt(spec_real ** 2 + spec_imag ** 2 + self.epsilon)
+        # Convertir a escala logarítmica (dB)
+        spec_db = 10 * torch.log10(spec_magnitude + self.epsilon)
+        return spec_db
 
 
-# -----------------------------
-# Visualización
-# -----------------------------
-def visualize_spectrogram(spectrogram: torch.Tensor, class_name: torch.Tensor, time_duration: float = 75e-3,
-                          n_fft=1024, win_length=1024, hop_length=1024, sample_freq=40e6,
+def visualize_spectrogram(spectrogram: torch.Tensor, class_name: torch.Tensor,
+                          n_fft=512, win_length=512, hop_length=5860, sample_freq=40e6,
                           show_stats: bool = True, figsize: tuple = (16, 4)) -> None:
+    print("------------> llega a visualize")
     """
     Visualize a spectrogram with I and Q channels.
 
@@ -161,104 +207,204 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: torch.Tensor, t
         plt.colorbar(im, ax=axes[ch], label='Power [dB]')
 
     plt.tight_layout()
+
     if SAVE_PLOTS:
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        out_path = PLOT_DIR / f"spectrogram_{ts}.png"
-        plt.savefig(out_path, dpi=120)
-        print(f"[pipeline] saved_plot={out_path}")
-    plt.show()
-
-    # Print statistics if requested (ignoring NaN values)
-    # Check for NaN values
-    nan_count = np.isnan(spectrogram_np).sum()
-    total_elements = spectrogram_np.size
-    print(f"NaN values in spectrogram: {nan_count} out of {total_elements} elements")
-    if show_stats:
-        print(f"\nSpectrogram Statistics (NaN-ignored):")
-        print(f"  Min: {np.nanmin(spectrogram_np):.2f} dB")
-        print(f"  Max: {np.nanmax(spectrogram_np):.2f} dB")
-        print(f"  Mean: {np.nanmean(spectrogram_np):.2f} dB")
-        print(f"  Std: {np.nanstd(spectrogram_np):.2f} dB")
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = PLOT_DIR / f"spectrogram_{ts}.png"
+            plt.savefig(out_path, dpi=120)
+            print(f"[pipeline] saved_plot={out_path}")
+        except Exception as e:
+            print("[pipeline] savefig error:", e)
+    else:
+        plt.close()
 
 
-# -----------------------------
-# Configuración del receptor BladeRF
-# -----------------------------
-rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(0))  # RX 2
+    # # Print statistics if requested (ignoring NaN values)
+    # # Check for NaN values
+    # nan_count = np.isnan(spectrogram_np).sum()
+    # total_elements = spectrogram_np.size
+    # print(f"NaN values in spectrogram: {nan_count} out of {total_elements} elements")
+    # if show_stats:
+    #     print(f"\nSpectrogram Statistics (NaN-ignored):")
+    #     print(f"  Min: {np.nanmin(spectrogram_np):.2f} dB")
+    #     print(f"  Max: {np.nanmax(spectrogram_np):.2f} dB")
+    #     print(f"  Mean: {np.nanmean(spectrogram_np):.2f} dB")
+    #     print(f"  Std: {np.nanstd(spectrogram_np):.2f} dB")
 
+
+def steering_vector(theta_deg, M, d_lambda):
+    m = np.arange(M)[:, None]  # (M,1)
+    return np.exp(-1j * 2 * np.pi * d_lambda * m * np.sin(np.deg2rad(theta_deg)))  # (M,1)
+
+
+def music_block(Xb, angles, d_lambda, num_expected_signals=1, diag_load=1e-6):
+    """
+    Xb: (K, M) snapshots complejos del bloque (K muestras, M sensores)
+    angles: array de ángulos en grados (p.ej. -90..90)
+    d_lambda: espaciamiento normalizado (d/λ)
+    num_expected_signals: nº de fuentes esperadas (>=1). Debe cumplirse M > num_expected_signals
+    diag_load: carga diagonal (se escala por la energía de R)
+    """
+    Xb = np.asarray(Xb, dtype=np.complex128)
+    K, M = Xb.shape
+
+    # --- Matriz de covarianza (Nr x Nr en tu base). Aquí Nr=M ---
+    # En tu base: R = r @ r^H, con r de tamaño (Nr x K).
+    # Como Xb es (K x M), r = Xb.T ⇒ R = Xb^H Xb / K (Hermítica, estable numéricamente).
+    R = (Xb.conj().T @ Xb) / max(1, K)
+    # Carga diagonal (escalada por energía) para estabilidad
+    R += (diag_load * (np.trace(R).real / M)) * np.eye(M)
+
+    J = np.fliplr(np.eye(R.shape[0]))  # Forward-Backward Averaging
+    R = 0.5 * (R + J @ R.conj() @ J)
+
+    # test simple: ¿hay fuente?
+    w, v = np.linalg.eigh(R)
+    ratio = (w[-1] / max(w[0], 1e-12)).real  # lambda_max / lambda_min
+    if ratio < 2:  # umbral 1.5–2 (ajústalo)
+        return np.ones(len(angles))  # espectro plano → “sin DOA”
+
+    # --- Descomposición espectral (usar 'eigh' para Hermítica) ---
+    w, v = np.linalg.eigh(R)  # autovalores ya en orden ascendente
+    d = int(np.clip(num_expected_signals, 0, M - 1))  # nº fuentes; garantizar M-d >= 1
+    # Subespacio de ruido: los M-d eigenvectores de autovalores más pequeños
+    Vn = v[:, :M - d]  # (M, M-d)
+
+    # Proyector de ruido (constante en el barrido)
+    Pn = Vn @ Vn.conj().T  # (M, M)
+
+    # --- Barrido angular (usamos tus 'angles' en º, no -π..π directamente) ---
+    ang = np.asarray(angles, dtype=float)
+    P = np.empty(ang.size, dtype=float)
+    idx = np.arange(M).reshape(-1, 1)  # (M,1)
+
+    for i, th_deg in enumerate(ang):
+        th = np.deg2rad(th_deg)
+        # Vector director ULA, elementos en posiciones 0, d, 2d, ... (referencia broadside)
+        # Si ves el pico espejado, invierte el signo del exponente.
+        a = np.exp(-2j * np.pi * d_lambda * idx * np.sin(th))  # (M,1)
+        denom = np.real((a.conj().T @ Pn @ a)[0, 0])
+        P[i] = 1.0 / max(denom, 1e-12)  # métrica MUSIC (lineal)
+
+    return P
+
+
+def publish_pred(label_id: int):
+    body = {
+        "label": classes[int(label_id)] if 0 <= int(label_id) < len(classes) else str(label_id),
+    }
+    # 1) directo al hub (instantáneo para el WS)
+    try:
+        pred_hub.set_last(body)
+    except Exception as e:
+        print("[pipeline] pred_hub.set_last error:", e)
+
+    # 2) opcional: POST al endpoint (desacoplar procesos / logs)
+    try:
+        requests.post(PRED_INGEST_URL, json=body, timeout=0.5)
+    except Exception as e:
+        print("[pipeline] publish_pred HTTP error:", e)
+
+
+# ---------------- BladeRF Configs ------------------------------------------------------------------------------------------------------------
+# --- Crear ambos canales RX ---
+rx1 = sdr.Channel(_bladerf.CHANNEL_RX(0))  # RX1 (antena 1)
+rx2 = sdr.Channel(_bladerf.CHANNEL_RX(1))  # RX2 (antena 2)
+
+# Configs
 sample_rate = 40e6
-center_freq = 2440000000
-step_freq = 40000000
-gain = 30
-num_samples = int(3e6)
-
-rx_ch.frequency = center_freq
-rx_ch.sample_rate = sample_rate
-rx_ch.bandwidth = sample_rate / 2
-rx_ch.gain_mode = _bladerf.GainMode.Manual
-rx_ch.gain = gain
-
-sdr.sync_config(
-    layout=_bladerf.ChannelLayout.RX_X1,
-    fmt=_bladerf.Format.SC16_Q11,
-    num_buffers=16,
-    buffer_size=8192,
-    num_transfers=8,
-    stream_timeout=3500
-)
-
-buf = bytearray(1024 * 4)
-print("Starting receive")
-rx_ch.enable = True
-direction = 1
-
+center_freq = 2000000000  # 2445.5 - 2455.5 #250 de 2455500000 # 250 de 2460000000
+step_freq = 20000000  # 20MHz
+gain = 30  # -15 a 60 dB
+num_samples = int(3e6)  # hop_lenght
 min_freq = 2400000000
 max_freq = 2480000000
+direction = 1
 
-start_time2 = time.time()
-b = 1
+# Mismos parámetros en ambos canales
+for ch in (rx1, rx2):
+    ch.frequency = center_freq
+    ch.sample_rate = sample_rate
+    ch.bandwidth = sample_rate / 2
+    ch.gain_mode = _bladerf.GainMode.Manual
+    ch.gain = gain
 
-# -----------------------------
-# Loop principal
-# -----------------------------
+# --- Sync: 2 Rx (MIMO) ---
+sdr.sync_config(layout=_bladerf.ChannelLayout.RX_X2,
+                fmt=_bladerf.Format.SC16_Q11,
+                num_buffers=16,
+                buffer_size=8192,
+                num_transfers=8,
+                stream_timeout=3500)
+
+# Habilitar ambos front-ends
+rx1.enable = True
+rx2.enable = True
+
+# --- Recepción y desentrelazado ---
+ints_per_frame = 4  # I0,Q0,I1,Q1
+bytes_per_frame = 2 * ints_per_frame  # 8 bytes
+buf = bytearray(1024 * bytes_per_frame)
+
+# ---------------- Variables matematicas y inicializacion de la clase transformadas de espectrogramas ------------------------------------------------------------------------------------------------------------
+
+transform = transform_spectrogram(
+    device="cpu",
+    n_fft=512,
+    win_length=512,
+    hop_length=5860,
+    window_fn=torch.hann_window,
+    power=None,
+    normalized=False,
+    center=False,
+    onesided=False
+)
+
+c = 299_792_458.0
+fc_hz = center_freq  # <-- Frecuencia central
+d_cm = 6.14  # <-- Separacion de antenas
+lam = c / fc_hz
+d_lambda = (d_cm / 100.0) / lam
+# print("d_lambda: ", d_lambda)
+block_size = 4096
+angles = np.linspace(-90, 90, 721)  # malla más fina
+
+# ---------------- LOOP PRINCIPAL ------------------------------------------------------------------------------------------------------------
+
+print("Starting dual-RX receive")
 while True:
-    start_time = time.time()
-    print("Frecuencia central: ", center_freq)
-    x = np.zeros(num_samples, dtype=np.complex64)
-    num_samples_read = 0
+    print(center_freq)
+    x1 = np.zeros(num_samples, dtype=np.complex64)
+    x2 = np.zeros(num_samples, dtype=np.complex64)
+    frames_read = 0
+    while frames_read < num_samples:
+        ask = min(len(buf) // bytes_per_frame, num_samples - frames_read)
+        sdr.sync_rx(buf, ask)
 
-    while True:
-        if num_samples > 0 and num_samples_read == num_samples:
-            break
-        elif num_samples > 0:
-            num = min(len(buf) // 4, num_samples - num_samples_read)
-        else:
-            num = len(buf) // 4
-        sdr.sync_rx(buf, num)
-        samples = np.frombuffer(buf, dtype=np.int16)
-        samples = samples[0::2] + 1j * samples[1::2]
-        samples /= 2048.0
-        x[num_samples_read:num_samples_read + num] = samples[0:num]
-        num_samples_read += num
+        raw = np.frombuffer(buf, dtype=np.int16, count=ask * ints_per_frame)
+        i0, q0 = raw[0::4].astype(np.float32), raw[1::4].astype(np.float32)
+        i1, q1 = raw[2::4].astype(np.float32), raw[3::4].astype(np.float32)
 
-    I = np.real(x)
-    Q = np.imag(x)
-    sample = torch.tensor(np.stack([I, Q], axis=0))
+        x1[frames_read:frames_read + ask] = (i0 + 1j * q0) / 2048.0
+        x2[frames_read:frames_read + ask] = (i1 + 1j * q1) / 2048.0
+        frames_read += ask
 
-    transform = transform_spectrogram(
-        device="cpu",
-        n_fft=1024,
-        win_length=1024,
-        hop_length=2930,
-        window_fn=torch.hann_window,
-        power=None,
-        normalized=False,
-        center=False,
-        onesided=False
-    )
-    spec = transform(sample)
-    spectrogram_np = spec.detach().cpu().numpy()
-    std = np.nanstd(spectrogram_np)
+    xc = correlate(x1, x2, mode='full')
+    lag = np.argmax(np.abs(xc)) - (len(x1) - 1)
+    phi = np.angle(np.vdot(x1, x2))  # fase media radiantes
+    phi_deg = np.degrees(phi)  # angulo
+    print(f"lag_muestras={lag}, fase_promedio={phi_deg:.3f} grados")
+
+    # Separar I y Q y pasarlo a torch como pedías
+    I1, Q1 = np.real(x1), np.imag(x1)
+    I2, Q2 = np.real(x2), np.imag(x2)
+
+    sample1 = torch.tensor(np.stack([I1, Q1], axis=0))  # RX1
+    sample2 = torch.tensor(np.stack([I2, Q2], axis=0))  # RX2
+
+    spec1 = transform(sample1)
+    spec2 = transform(sample2)
 
     if center_freq >= max_freq:
         center_freq = max_freq
@@ -267,19 +413,128 @@ while True:
         center_freq = min_freq
         direction = 1
 
-    print(spec.shape)
-
-    spec = torch.tensor(spec, dtype=torch.float32).view(1, 1, 1024, 1024)
-
-    # --- Inferencia usando el modelo trazado ---
+    spec = spec1.type(torch.float32).unsqueeze(0).unsqueeze(0)
     with torch.no_grad():
-        logit = convnext_tiny_model(spec)
-        prob = logit.argmax(dim=1)
+        # Binario -----------------------
+        # outputs = model(spec).view(-1)
+        # preds = (torch.sigmoid(outputs) > 0.5).float()
+        # probs = torch.sigmoid(outputs)
+        # Multi-Class ----------------------------
+        # outputs = model(spec)
+        # probs = torch.softmax(outputs, dim=1)  # Convert to probabilities
+        # print(probs)
+        # pred = probs.argmax(dim=1)
+        # 3 clases--------------------
+        outputs = model(spec)  # (N, C)
+        preds = outputs.argmax(dim=1)
+        probs = torch.softmax(outputs, dim=1)
 
-    end_time = time.time()
-    print(f"Tiempo de leer y realizar el espectrograma: {end_time - start_time:.6f} segundos")
+    drone_predict = dictionaryDrones[preds.item()]
+    print(drone_predict)
+    frame = make_psd_frame(x=x1, center_hz=center_freq, sample_rate=sample_rate, nfft=4096,
+                           drone_id=dictionaryDrones[preds.item()], schema_version="1.0")
+    psd_hub.set_last(frame)
+
+    publish_psd(x1, center_freq, sample_rate, nfft=4096,
+                drone_id=dictionaryDrones[preds.item()])
+
+    preds = outputs.argmax(dim=1)
+    probs = torch.softmax(outputs, dim=1)
+
+    # mapea a tu diccionario de clases
+    classes = [dictionaryDrones[i] for i in range(NUM_CLASSES)]
+    label_id = int(preds.item())
+    probs_np = probs[0].detach().cpu().numpy()
+
+    # publica predicción
+    publish_pred(label_id=label_id)
 
     visualize_spectrogram(
-        spectrogram=spec.view(1, 1024, 1024),
-        class_name=f"{prob}"
+        spectrogram=spec.view(1, 512, 512),
+        class_name=f"test"
     )
+
+    if (drone_predict == 'Noise' or drone_predict == 'Jammer'):
+        center_freq += direction * step_freq
+        for ch in (rx1, rx2):
+            ch.frequency = center_freq
+        continue
+
+    if (drone_predict != 'Noise' and drone_predict != 'Jammer'):
+        # Nuevas variables si cambio de frecuencia:
+        fc_hz = center_freq
+        lam = c / fc_hz
+        d_lambda = (d_cm / 100.0) / lam
+        # normaliza potencia
+        x1 /= np.sqrt(np.mean(np.abs(x1) ** 2))
+        x2 /= np.sqrt(np.mean(np.abs(x2) ** 2))
+        X_full = np.stack([x1, x2], axis=1)  # shape (N, 2)
+        num_blocks = X_full.shape[0] // block_size
+        acc = np.zeros(len(angles), dtype=float)
+
+        num_signals = 1
+        for b in range(num_blocks):
+            sl = slice(b * block_size, (b + 1) * block_size)
+            Xb = X_full[sl, :]  # (K, 2)
+            acc += music_block(Xb, angles, d_lambda, num_expected_signals=num_signals, diag_load=1e-6)
+
+        P_music = acc / max(1, num_blocks)
+        psr_db = 10 * np.log10(P_music.max() / (np.median(P_music) + 1e-12))  # peak/median
+        if psr_db < 6:  # 6–8 dB típico
+            print(f"Sin DOA confiable (PSR={psr_db:.1f} dB).")
+        # ===== Estimar ángulo a partir de music =====
+        P_lin = np.asarray(P_music, float)
+        ang = np.asarray(angles, float)
+        step = ang[1] - ang[0]
+
+        # Evitar picos falsos en los bordes (+/-90°)
+        edge = 2
+        i_search = np.arange(edge, len(P_lin) - edge)
+        i0 = i_search[np.argmax(P_lin[i_search])]  # índice del pico
+
+        # Refinamiento sub-bin (parabólico) en POTENCIA lineal
+        if 0 < i0 < len(P_lin) - 1:
+            y1, y2, y3 = P_lin[i0 - 1], P_lin[i0], P_lin[i0 + 1]
+            denom = (y1 - 2 * y2 + y3)
+            delta = 0.5 * (y1 - y3) / denom if denom != 0 else 0.0
+        else:
+            delta = 0.0
+
+        theta_hat = ang[i0] + delta * step  # grados
+        print("El angulo en que se encuentra el dron es: ", theta_hat)
+
+        # ---------------------------
+        # Gráfica polar semicircular en dB
+        # ---------------------------
+        dr = 15  # rango dinámico mostrado en dB (ajústalo a gusto)
+        P_db = 10 * np.log10(np.maximum(P_music, 1e-12))
+        P_db = np.clip(P_db - P_db.max(), -dr, 0)  # normaliza pico a 0 dB y recorta a [-dr, 0]
+
+        theta = np.deg2rad(angles)
+        MILITARY_GREEN = "#4B9920"  # verde militar (Army Green)
+
+        fig = plt.figure(figsize=(16, 7), facecolor="none")
+        ax = fig.add_subplot(111, projection="polar", facecolor="none")
+        ax.patch.set_alpha(0.0)  # fondo del eje transparente
+        fig.patch.set_alpha(0.0)  # fondo de la figura transparente
+        ax.plot(theta, P_db, linewidth=2, color=MILITARY_GREEN)
+
+        # Semicírculo superior: 0° arriba, -90° izq, +90° der (sentido horario)
+        ax.set_theta_zero_location("N")
+        ax.set_theta_direction(-1)
+        ax.set_thetamin(-90)
+        ax.set_thetamax(90)
+
+        # Escala radial en dB (0 dB afuera, -dr dB hacia adentro)
+        ax.set_rlim(-dr, 0)
+        ax.set_rlabel_position(180)  # etiquetas a la izquierda, como en tu ejemplo
+        ax.grid(True)
+        plt.tight_layout()
+
+        if SAVE_PLOTS:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = PLOT_DIR / f"direction_{ts}.png"
+            plt.savefig(out_path, dpi=120)
+            print(f"[pipeline] saved_plot={out_path}")
+        plt.show()
+sdr.close()
