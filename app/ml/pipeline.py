@@ -15,12 +15,14 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.api.routers.pipeline_router import psd_hub, make_psd_frame, pred_hub
+from app.api.routers.pipeline_router import psd_hub, make_psd_frame, pred_hub, doa_hub
 
 INGEST_URL = os.getenv("PSD_INGEST_URL", "http://127.0.0.1:8000/pipeline/psd/ingest")
 PRED_INGEST_URL = os.getenv("PRED_INGEST_URL", "http://127.0.0.1:8000/pipeline/pred/ingest")
+DOA_INGEST_URL = os.getenv("DOA_INGEST_URL", "http://127.0.0.1:8000/pipeline/doa/ingest")
 # ------- Apertura robusta del bladeRF ------------------------------------------------------------------------------------------
 os.environ.setdefault("LIBUSB_DEBUG", "3")
+os.environ.pop("LIBUSB_DEBUG", None)
 DEV_ID = os.getenv("BLADERF_DEVICE")
 try:
     if DEV_ID:
@@ -54,7 +56,8 @@ dictionaryDrones = {0: 'DJI Mini 4K', 1: 'Jammer', 2: 'Noise'}
 # --------------------------------- LOAD MODEL -----------------------------------------------------------------------------------------
 IN_CHANNELS = 1
 NUM_CLASSES = 3
-
+shape = 512  # 512 - 1024
+hop = 5860  # 5860 - 2930
 MODEL_TRACE = "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_mc.pt"
 
 try:
@@ -101,9 +104,9 @@ class transform_spectrogram(torch.nn.Module):
     def __init__(
             self,
             device,
-            n_fft=512,
-            win_length=512,
-            hop_length=5860,
+            n_fft=shape,
+            win_length=shape,
+            hop_length=hop,
             window_fn=torch.hann_window,
             power=None,
             normalized=False,
@@ -137,9 +140,8 @@ class transform_spectrogram(torch.nn.Module):
 
 
 def visualize_spectrogram(spectrogram: torch.Tensor, class_name: torch.Tensor,
-                          n_fft=512, win_length=512, hop_length=5860, sample_freq=40e6,
+                          n_fft=shape, win_length=shape, hop_length=hop, sample_freq=40e6,
                           show_stats: bool = True, figsize: tuple = (16, 4)) -> None:
-    print("------------> llega a visualize")
     """
     Visualize a spectrogram with I and Q channels.
 
@@ -306,24 +308,39 @@ def publish_pred(label_id: int):
     except Exception as e:
         print("[pipeline] publish_pred HTTP error:", e)
 
+def publish_doa(angle_deg: float):
+
+    body = {
+        "angle_deg": float(angle_deg),
+    }
+    try:
+        doa_hub.set_last(body)
+    except Exception as e:
+        print("[pipeline] doa_hub.set_last error:", e)
+    try:
+        requests.post(DOA_INGEST_URL, json=body, timeout=0.5)
+    except Exception as e:
+        print("[pipeline] publish_doa HTTP error:", e)
+
 
 # ---------------- BladeRF Configs ------------------------------------------------------------------------------------------------------------
 # --- Crear ambos canales RX ---
+rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(1))  # RX 2
 rx1 = sdr.Channel(_bladerf.CHANNEL_RX(0))  # RX1 (antena 1)
-rx2 = sdr.Channel(_bladerf.CHANNEL_RX(1))  # RX2 (antena 2)
 
 # Configs
 sample_rate = 40e6
-center_freq = 2000000000  # 2445.5 - 2455.5 #250 de 2455500000 # 250 de 2460000000
-step_freq = 20000000  # 20MHz
+center_freq = 2440000000  # 2445.5 - 2455.5 #250 de 2455500000 # 250 de 2460000000
 gain = 30  # -15 a 60 dB
-num_samples = int(3e6)  # hop_lenght
+num_samples = int(3e6)
+
+step_freq = 20000000  # 20MHz
 min_freq = 2400000000
 max_freq = 2480000000
 direction = 1
 
 # Mismos parámetros en ambos canales
-for ch in (rx1, rx2):
+for ch in (rx1, rx_ch):
     ch.frequency = center_freq
     ch.sample_rate = sample_rate
     ch.bandwidth = sample_rate / 2
@@ -331,29 +348,28 @@ for ch in (rx1, rx2):
     ch.gain = gain
 
 # --- Sync: 2 Rx (MIMO) ---
-sdr.sync_config(layout=_bladerf.ChannelLayout.RX_X2,
-                fmt=_bladerf.Format.SC16_Q11,
+sdr.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
+                fmt=_bladerf.Format.SC16_Q11,  # int16s
                 num_buffers=16,
                 buffer_size=8192,
                 num_transfers=8,
                 stream_timeout=3500)
 
 # Habilitar ambos front-ends
-rx1.enable = True
-rx2.enable = True
+rx1.enable = False
+rx_ch.enable = True
 
 # --- Recepción y desentrelazado ---
-ints_per_frame = 4  # I0,Q0,I1,Q1
-bytes_per_frame = 2 * ints_per_frame  # 8 bytes
-buf = bytearray(1024 * bytes_per_frame)
+bytes_per_sample = 4  # int16 I + int16 Q
+buf = bytearray(1024 * bytes_per_sample)
 
 # ---------------- Variables matematicas y inicializacion de la clase transformadas de espectrogramas ------------------------------------------------------------------------------------------------------------
 
 transform = transform_spectrogram(
     device="cpu",
-    n_fft=512,
-    win_length=512,
-    hop_length=5860,
+    n_fft=shape,
+    win_length=shape,
+    hop_length=hop,
     window_fn=torch.hann_window,
     power=None,
     normalized=False,
@@ -374,37 +390,40 @@ angles = np.linspace(-90, 90, 721)  # malla más fina
 
 print("Starting dual-RX receive")
 while True:
-    print(center_freq)
-    x1 = np.zeros(num_samples, dtype=np.complex64)
-    x2 = np.zeros(num_samples, dtype=np.complex64)
-    frames_read = 0
-    while frames_read < num_samples:
-        ask = min(len(buf) // bytes_per_frame, num_samples - frames_read)
-        sdr.sync_rx(buf, ask)
+    print("[FRECUENCIA]: ", center_freq)
+    rx1.enable = False
+    rx_ch.enable = False
+    sdr.sync_config(layout=_bladerf.ChannelLayout.RX_X1,
+                    fmt=_bladerf.Format.SC16_Q11,  # int16s
+                    num_buffers=16,
+                    buffer_size=8192,
+                    num_transfers=8,
+                    stream_timeout=3500)
+    rx1.enable = False
+    rx_ch.enable = True
+    x = np.zeros(num_samples, dtype=np.complex64)  # storage for IQ samples
+    num_samples_read = 0
+    while True:
+        if num_samples > 0 and num_samples_read == num_samples:
+            break
+        elif num_samples > 0:
+            num = min(len(buf) // bytes_per_sample, num_samples - num_samples_read)
+        else:
+            num = len(buf) // bytes_per_sample
+        sdr.sync_rx(buf, num)  # Read into buffer
+        samples = np.frombuffer(buf, dtype=np.int16)
+        samples = samples[0::2] + 1j * samples[1::2]  # Convert to complex type
+        samples /= 2048.0  # Scale to -1 to 1 (12-bit ADC)
+        x[num_samples_read:num_samples_read + num] = samples[0:num]  # Store buf in samples array
+        num_samples_read += num
 
-        raw = np.frombuffer(buf, dtype=np.int16, count=ask * ints_per_frame)
-        i0, q0 = raw[0::4].astype(np.float32), raw[1::4].astype(np.float32)
-        i1, q1 = raw[2::4].astype(np.float32), raw[3::4].astype(np.float32)
+    # Separar I y Q
+    I = np.real(x)
+    Q = np.imag(x)
 
-        x1[frames_read:frames_read + ask] = (i0 + 1j * q0) / 2048.0
-        x2[frames_read:frames_read + ask] = (i1 + 1j * q1) / 2048.0
-        frames_read += ask
+    sample = torch.tensor(np.stack([I, Q], axis=0))
 
-    xc = correlate(x1, x2, mode='full')
-    lag = np.argmax(np.abs(xc)) - (len(x1) - 1)
-    phi = np.angle(np.vdot(x1, x2))  # fase media radiantes
-    phi_deg = np.degrees(phi)  # angulo
-    print(f"lag_muestras={lag}, fase_promedio={phi_deg:.3f} grados")
-
-    # Separar I y Q y pasarlo a torch como pedías
-    I1, Q1 = np.real(x1), np.imag(x1)
-    I2, Q2 = np.real(x2), np.imag(x2)
-
-    sample1 = torch.tensor(np.stack([I1, Q1], axis=0))  # RX1
-    sample2 = torch.tensor(np.stack([I2, Q2], axis=0))  # RX2
-
-    spec1 = transform(sample1)
-    spec2 = transform(sample2)
+    spec = transform(sample)
 
     if center_freq >= max_freq:
         center_freq = max_freq
@@ -413,7 +432,7 @@ while True:
         center_freq = min_freq
         direction = 1
 
-    spec = spec1.type(torch.float32).unsqueeze(0).unsqueeze(0)
+    spec = torch.tensor(spec, dtype=torch.float32).view(1, 1, 512, 512)
     with torch.no_grad():
         # Binario -----------------------
         # outputs = model(spec).view(-1)
@@ -431,11 +450,11 @@ while True:
 
     drone_predict = dictionaryDrones[preds.item()]
     print(drone_predict)
-    frame = make_psd_frame(x=x1, center_hz=center_freq, sample_rate=sample_rate, nfft=4096,
+    frame = make_psd_frame(x=x, center_hz=center_freq, sample_rate=sample_rate, nfft=4096,
                            drone_id=dictionaryDrones[preds.item()], schema_version="1.0")
     psd_hub.set_last(frame)
 
-    publish_psd(x1, center_freq, sample_rate, nfft=4096,
+    publish_psd(x, center_freq, sample_rate, nfft=4096,
                 drone_id=dictionaryDrones[preds.item()])
 
     preds = outputs.argmax(dim=1)
@@ -447,16 +466,15 @@ while True:
     probs_np = probs[0].detach().cpu().numpy()
 
     # publica predicción
-    publish_pred(label_id=label_id)
+    # publish_pred(label_id=label_id)
 
     visualize_spectrogram(
-        spectrogram=spec.view(1, 512, 512),
-        class_name=f"test"
-    )
+        spectrogram=spec.view(1, shape, shape),
+        class_name=f"{drone_predict}")
 
-    if (drone_predict == 'Noise' or drone_predict == 'Jammer'):
+    if (drone_predict == 'Noise' or drone_predict == "Jammer"):
         center_freq += direction * step_freq
-        for ch in (rx1, rx2):
+        for ch in (rx1, rx_ch):
             ch.frequency = center_freq
         continue
 
@@ -465,9 +483,34 @@ while True:
         fc_hz = center_freq
         lam = c / fc_hz
         d_lambda = (d_cm / 100.0) / lam
+        rx1.enable = False
+        rx_ch.enable = False
+        sdr.sync_config(_bladerf.ChannelLayout.RX_X2,
+                        _bladerf.Format.SC16_Q11,
+                        num_buffers=32,
+                        buffer_size=8192,
+                        num_transfers=16,
+                        stream_timeout=3500)
+        rx1.enable = True
+        rx_ch.enable = True
+
+        num_samples_doa = 4096
+        buf = bytearray(num_samples_doa * 8)
+        sdr.sync_rx(buf, num_samples_doa)
+        raw = np.frombuffer(buf, dtype=np.int16).reshape(-1, 4)
+        x1 = (raw[:, 0] + 1j * raw[:, 1]) / 2048.0
+        x2 = (raw[:, 2] + 1j * raw[:, 3]) / 2048.0
+
         # normaliza potencia
         x1 /= np.sqrt(np.mean(np.abs(x1) ** 2))
         x2 /= np.sqrt(np.mean(np.abs(x2) ** 2))
+
+        xc = correlate(x1, x2, mode='full')
+        lag = np.argmax(np.abs(xc)) - (len(x1) - 1)
+        phi = np.angle(np.vdot(x1, x2))  # fase media radiantes
+        phi_deg = np.degrees(phi)  # angulo
+        print(f"[LECTURA 2 Antennas] lag_muestras={lag}, fase_promedio={phi_deg:.3f} grados")
+
         X_full = np.stack([x1, x2], axis=1)  # shape (N, 2)
         num_blocks = X_full.shape[0] // block_size
         acc = np.zeros(len(angles), dtype=float)
@@ -480,7 +523,7 @@ while True:
 
         P_music = acc / max(1, num_blocks)
         psr_db = 10 * np.log10(P_music.max() / (np.median(P_music) + 1e-12))  # peak/median
-        if psr_db < 6:  # 6–8 dB típico
+        if psr_db < 8:  # 6–8 dB típico
             print(f"Sin DOA confiable (PSR={psr_db:.1f} dB).")
         # ===== Estimar ángulo a partir de music =====
         P_lin = np.asarray(P_music, float)
@@ -502,6 +545,10 @@ while True:
 
         theta_hat = ang[i0] + delta * step  # grados
         print("El angulo en que se encuentra el dron es: ", theta_hat)
+
+        publish_doa(
+            angle_deg=float(theta_hat),
+        )
 
         # ---------------------------
         # Gráfica polar semicircular en dB

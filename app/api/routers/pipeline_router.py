@@ -132,6 +132,9 @@ class PsdFrameModel(BaseModel):
     ds: Optional[int] = None
     schema_version: Optional[str] = None
 
+class DoaResultModel(BaseModel):
+    angle_deg: float = Field(..., description="Ángulo estimado (grados, [-90,90])")
+
 # ====== PREDICCIONES (hub + endpoints) =======================================
 class PredResultModel(BaseModel):
     label: str = Field(..., description="Nombre de la clase predicha")
@@ -182,6 +185,21 @@ class _PsdHub:
 
 
 psd_hub = _PsdHub()
+
+class _DoaHub:
+    def __init__(self):
+        self._last: Optional[Dict[str, Any]] = None
+        self._lock = threading.Lock()
+
+    def set_last(self, doa: Dict[str, Any]) -> None:
+        with self._lock:
+            self._last = doa
+
+    def get_last(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._last) if self._last is not None else None
+
+doa_hub = _DoaHub()
 
 def _slice_frame_by_hz(frame: Dict[str, Any], min_hz: Optional[float], max_hz: Optional[float]) -> Dict[str, Any]:
     if min_hz is None and max_hz is None:
@@ -406,3 +424,37 @@ def pred_mock():
     }
     pred_hub.set_last(pred)
     return pred
+
+# ===== DOA =====
+@router.websocket("/ws/doa")
+async def ws_doa(
+    ws: WebSocket,
+    interval_ms: int = Query(200, ge=50, le=5000, description="Período de envío (ms)")
+):
+    await ws.accept()
+    try:
+        last_sent_ts = 0.0
+        while True:
+            await asyncio.sleep(interval_ms / 1000.0)
+            doa = doa_hub.get_last()
+            if not doa:
+                continue
+            ts = float(doa.get("capture_time_sec") or 0.0)
+            if ts and ts <= last_sent_ts:
+                continue
+            await ws.send_json(doa)
+            last_sent_ts = ts if ts else time.time()
+    except Exception:
+        return
+
+@router.get("/doa/latest", response_model=DoaResultModel)
+def get_latest_doa():
+    doa = doa_hub.get_last()
+    if not doa:
+        raise HTTPException(status_code=404, detail="No hay DOA aún (doa_hub vacío).")
+    return doa
+
+@router.post("/doa/ingest", status_code=202)
+def ingest_doa(doa: DoaResultModel = Body(...)):
+    doa_hub.set_last(doa.dict())
+    return {"ok": True}
