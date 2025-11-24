@@ -1,3 +1,16 @@
+import os
+import sys
+import ctypes
+
+# Asegurar que libbladeRF esté visible para CFFI
+lib_path = "/opt/homebrew/lib/libbladeRF.dylib"
+if os.path.exists(lib_path):
+    ctypes.cdll.LoadLibrary(lib_path)
+    os.environ["DYLD_LIBRARY_PATH"] = os.path.dirname(lib_path) + ":" + os.environ.get("DYLD_LIBRARY_PATH", "")
+else:
+    print(f"⚠️ No se encontró la librería en {lib_path}")
+    sys.exit(1)
+
 from bladerf import _bladerf
 import numpy as np
 import time
@@ -11,13 +24,13 @@ from pathlib import Path
 from datetime import datetime
 from torchaudio.transforms import Spectrogram
 from scipy.signal import correlate
+import shutil
 
-# pipeline.py está en app/ml/, la raíz del proyecto es parents[2]
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from app.api.routers.pipeline_router import psd_hub, make_psd_frame, pred_hub, doa_hub
+from app.api.routers.pipeline_router import psd_hub, make_psd_frame, pred_hub, doa_hub, spec_hub
 
 # ================================================================================
 # CONFIGURATION
@@ -99,13 +112,22 @@ VIS_CONFIG = {
 # ------- Plot Saving Configuration -------------------------------------------
 SAVE_PLOTS = os.getenv("PIPELINE_SAVE_PLOTS", "1") == "1"
 PLOT_DIR = Path(os.getenv("PIPELINE_PLOT_DIR","/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots"))
+
+# Rutas para "última" imagen (las que va a servir FastAPI)
+LAST_SPEC_PATH = Path(os.getenv("PIPELINE_LAST_SPEC", "/tmp/morpheus_pipeline/last_spectrogram.png"))
+LAST_DOA_PATH = Path(os.getenv("PIPELINE_LAST_DOA", "/tmp/morpheus_pipeline/last_doa.png"))
+
 if SAVE_PLOTS:
     PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    LAST_SPEC_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LAST_DOA_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ------- API Endpoints -------------------------------------------------------
 INGEST_URL = os.getenv("PSD_INGEST_URL", "http://127.0.0.1:8000/pipeline/psd/ingest")
 PRED_INGEST_URL = os.getenv("PRED_INGEST_URL", "http://127.0.0.1:8000/pipeline/pred/ingest")
 DOA_INGEST_URL = os.getenv("DOA_INGEST_URL", "http://127.0.0.1:8000/pipeline/doa/ingest")
+SPEC_INGEST_URL = os.getenv("SPEC_INGEST_URL","http://127.0.0.1:8000/pipeline/spec/ingest")
+
 
 # ------- DOA Configuration ---------------------------------------------------
 DOA_CONFIG = {
@@ -208,13 +230,29 @@ def publish_doa(angle_deg: float):
         "angle_deg": float(angle_deg),
     }
     try:
-        doa_hub.set_last(body)
-    except Exception as e:
-        print("[pipeline] doa_hub.set_last error:", e)
-    try:
         requests.post(DOA_INGEST_URL, json=body, timeout=0.5)
     except Exception as e:
         print("[pipeline] publish_doa HTTP error:", e)
+
+def build_spectrogram_frame(spectrogram: torch.Tensor, class_name: str) -> dict:
+    spec_np = spectrogram.detach().cpu().numpy()  # (C, F, T)
+    C, F, T = spec_np.shape
+
+    pmin = float(np.nanmin(spec_np))
+    pmax = float(np.nanmax(spec_np))
+
+    frame = {
+        "label": class_name,
+        "timestamp": time.time(),
+        "shape": [C, F, T],
+        "n_fft": SPEC_CONFIG["n_fft"],
+        "hop_length": SPEC_CONFIG["hop_length"],
+        "sample_rate": SDR_CONFIG["sample_rate"],
+        "pmin": pmin,
+        "pmax": pmax,
+        "data": spec_np.tolist(),
+    }
+    return frame
 
 
 
@@ -308,12 +346,20 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
     if spectrogram.ndim == 3:
         if spectrogram.shape[0] == 2:
             ch_names = {0: "I Spectrogram", 1: "Q Spectrogram"}
-            fig, axes = plt.subplots(1, 2, figsize=figsize)
+            fig, axes = plt.subplots(1, 2, figsize=figsize, facecolor = "none")
+            axes.patch.set_alpha(0.0)
+            axes.spines['bottom'].set_color('white')
+            axes.spines['left'].set_color('white')
+            fig.patch.set_alpha(0)
             fig.suptitle(f'{class_name}')
         elif spectrogram.shape[0] == 1:
-            ch_names = {0: f"Power Spectrogram - {class_name}"}
+            ch_names = {0: f"Power Spectrogram"}
             fig, axes = plt.subplots(1, 1, figsize=figsize)
+            axes.patch.set_alpha(0.0)
+            axes.spines['bottom'].set_color('white')
+            axes.spines['left'].set_color('white')
             axes = [axes]  # Make it iterable
+            fig.patch.set_alpha(0)
         else:
             raise ValueError(f"Spectrogram shape {spectrogram.shape} doesn't match expected dimensions")
     else:
@@ -354,7 +400,10 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
 
     # Create visualization for each channel
     for ch in range(spectrogram_np.shape[0]):
+
         # Use imshow for faster rendering
+
+
         im = axes[ch].imshow(
             spectrogram_np[ch],
             aspect='auto',
@@ -364,13 +413,11 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
             vmin=pmin,
             vmax=pmax
         )
-        axes[ch].set_ylabel('Frequency [MHz]')
-        axes[ch].set_xlabel('Time [ms]')
         # Set x-axis ticks in milliseconds
         max_time = time_duration_ms[-1] if len(time_duration_ms) > 0 else 75
-        axes[ch].set_xticks(np.arange(0, max_time, step=10))  # every 10 ms
-        axes[ch].set_title(f'{ch_names[ch]}')
-        plt.colorbar(im, ax=axes[ch], label='Power [dB]')
+        axes[ch].set_xticks(np.arange(0, max_time, step=10), )
+        axes[ch].tick_params(axis='x', colors='white')
+        axes[ch].tick_params(axis='y', colors='white')
 
     plt.tight_layout()
 
@@ -382,17 +429,20 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
         print(f"   Mean: {np.nanmean(spectrogram_np):.2f} dB")
         print(f"   Std: {np.nanstd(spectrogram_np):.2f} dB")
 
-    # Keep your existing save/close logic
-    # if SAVE_PLOTS:
-    #     try:
-    #         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    #         out_path = PLOT_DIR / f"spectrogram_{ts}.png"
-    #         plt.savefig(out_path, dpi=120)
-    #         print(f"[Visualización] Espectrograma guardado: {out_path}")
-    #     except Exception as e:
-    #         print("[Visualización] savefig error:", e)
-    # else:
-    #     plt.close()
+    if SAVE_PLOTS:
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            out_path = PLOT_DIR / f"spectrogram_{ts}.png"
+            fig.savefig(out_path, dpi=120)
+            print(f"[Visualización] Espectrograma guardado: {out_path}")
+
+            # Copiamos a una ruta fija que servirá el endpoint
+            shutil.copy2(out_path, LAST_SPEC_PATH)
+            print(f"[Visualización] Último espectrograma actualizado: {LAST_SPEC_PATH}")
+        except Exception as e:
+            print("[Visualización] savefig error:", e)
+
+    plt.close(fig)
 
 
 # ------- DOA Functions -------------------------------------------------------
@@ -457,17 +507,16 @@ def publish_pred(label_name: str, confidence: float = None,
     else:
         body["prediction_mode"] = "single_stage"
 
-    # 1) directo al hub (instantáneo para el WS)
-    try:
-        pred_hub.set_last(body)
-    except Exception as e:
-        print("[pipeline] pred_hub.set_last error:", e)
-
-    # 2) opcional: POST al endpoint
     try:
         requests.post(PRED_INGEST_URL, json=body, timeout=0.5)
     except Exception as e:
         print("[pipeline] publish_pred HTTP error:", e)
+
+def publish_spec(frame: dict):
+    try:
+        requests.post(SPEC_INGEST_URL, json=frame, timeout=0.7)
+    except Exception as e:
+        print("[pipeline] publish_spec HTTP error:", e)
 
 
 # ================================================================================
@@ -602,10 +651,17 @@ try:
         # Publish PSD
         frame = make_psd_frame(x=x, center_hz=center_freq, sample_rate=SDR_CONFIG['sample_rate'],
                                nfft=1024, drone_id=drone_predict, schema_version="1.0")
-        psd_hub.set_last(frame)
         publish_psd(x, center_freq, SDR_CONFIG['sample_rate'], nfft=1024, drone_id=drone_predict)
 
-        # Visualize
+        try:
+            spec_frame = build_spectrogram_frame(
+                spectrogram=spec.unsqueeze(0),
+                class_name=drone_predict,
+            )
+            publish_spec(spec_frame)
+        except Exception as e:
+            print("[pipeline] spec_hub.set_last error:", e)
+
         visualize_spectrogram(
             spectrogram=spec.unsqueeze(0),
             class_name=f"{drone_predict}",
@@ -733,6 +789,8 @@ try:
         # Print processing time
         elapsed = time.time() - start_time
         print(f"[Pipeline] Tiempo de procesamiento: {elapsed:.3f} segundos\n")
+
+
 
 except KeyboardInterrupt:
     print("\n[Pipeline] Interrumpido por el usuario (Ctrl+C)")

@@ -1,8 +1,8 @@
 # app/pipeline_router.py
 from __future__ import annotations
 
+import sys
 import io
-import json
 import os
 import subprocess
 from pathlib import Path
@@ -25,7 +25,9 @@ PIPELINE_PATH = Path(__file__).resolve().parents[2] / "ml" / "pipeline.py"
 LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "/tmp/morpheus_pipeline"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 CWD = Path(os.getenv("PIPELINE_CWD", str(PIPELINE_PATH.parent)))
-PYTHON_BIN = os.getenv("PYTHON_BIN", "python")  # opcional: fuerza intérprete
+PYTHON_BIN = os.getenv("PYTHON_BIN", sys.executable)
+LAST_SPEC_PATH = Path(os.getenv("PIPELINE_LAST_SPEC", "/tmp/morpheus_pipeline/last_spectrogram.png"))
+LAST_DOA_PATH  = Path(os.getenv("PIPELINE_LAST_DOA",  "/tmp/morpheus_pipeline/last_doa.png"))
 
 # Imagen "clásica" por compatibilidad (si tu pipeline guarda last.png)
 LAST_IMG_PATH = Path(os.getenv("PIPELINE_LAST_IMG", "/tmp/morpheus_pipeline/last.png"))
@@ -230,10 +232,7 @@ def _slice_frame_by_hz(frame: Dict[str, Any], min_hz: Optional[float], max_hz: O
     return sliced
 
 def _compute_psd_db(x: np.ndarray, nfft: int = 4096, window: str = "hann") -> np.ndarray:
-    """
-    x: array complejo 1D (IQ, baseband) np.complex64/complex128
-    Retorna PSD en dB (log |FFT|), length=nfft, centrada (fftshift).
-    """
+
     if x.ndim != 1:
         raise ValueError("x debe ser 1D complejo")
 
@@ -283,6 +282,115 @@ def make_psd_frame(
     )
     return frame
 
+class _SpecHub:
+
+    def __init__(self):
+        self._last: Optional[Dict[str, Any]] = None
+        self._lock = threading.Lock()
+
+    def set_last(self, spec: Dict[str, Any]) -> None:
+        with self._lock:
+            self._last = spec
+
+    def get_last(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._last) if self._last is not None else None
+
+spec_hub = _SpecHub()
+
+
+# ============================================================================
+
+def _slice_frame_by_hz(frame: Dict[str, Any], min_hz: Optional[float], max_hz: Optional[float]) -> Dict[str, Any]:
+    if min_hz is None and max_hz is None:
+        return frame
+
+    start_hz = float(frame["start_hz"])
+    bin_hz = float(frame["bin_hz"])
+    bins = frame["bins"]
+    n = len(bins)
+
+    lo_idx = 0 if min_hz is None else int(math.floor((min_hz - start_hz) / bin_hz))
+    hi_idx = n if max_hz is None else int(math.ceil((max_hz - start_hz) / bin_hz))
+
+    lo_idx = max(0, lo_idx)
+    hi_idx = min(n, hi_idx)
+    if hi_idx <= lo_idx:
+
+        return {
+            **frame,
+            "bins": [],
+            "fft_size": 0,
+        }
+
+    sliced = dict(frame)
+    sliced["bins"] = bins[lo_idx:hi_idx]
+    sliced["start_hz"] = start_hz + lo_idx * bin_hz
+    sliced["fft_size"] = len(sliced["bins"])
+    return sliced
+
+
+def _compute_psd_db(x: np.ndarray, nfft: int = 4096, window: str = "hann") -> np.ndarray:
+    if x.ndim != 1:
+        raise ValueError("x debe ser 1D complejo")
+
+
+    seg = x[:nfft]
+    if seg.shape[0] < nfft:
+        seg = np.pad(seg, (0, nfft - seg.shape[0]))
+
+    # Ventana
+    if window == "hann":
+        w = np.hanning(nfft)
+    elif window == "hamming":
+        w = np.hamming(nfft)
+    else:
+        w = np.ones(nfft)
+
+    seg = seg * w
+    X = np.fft.fftshift(np.fft.fft(seg, n=nfft))
+    psd = 20.0 * np.log10(np.abs(X) + 1e-12)
+    return psd
+
+
+def make_psd_frame(
+        x: np.ndarray,
+        center_hz: float,
+        sample_rate: float,
+        nfft: int = 4096,
+        *,
+        drone_id: Optional[str] = None,
+        hop_samples: Optional[int] = None,
+        ds: Optional[int] = None,
+        schema_version: str = "1.0",
+) -> Dict[str, Any]:
+    psd_db = _compute_psd_db(x=x, nfft=nfft, window="hann")
+    start_hz = float(center_hz - sample_rate / 2.0)
+    bin_hz = float(sample_rate / nfft)
+    frame: Dict[str, Any] = dict(
+        start_hz=start_hz,
+        bin_hz=bin_hz,
+        bins=psd_db.astype(float).tolist(),
+        capture_time_sec=time.time(),
+        drone_id=drone_id,
+        fft_size=nfft,
+        hop_samples=hop_samples,
+        ds=ds,
+        schema_version=schema_version,
+    )
+    return frame
+
+
+class SpecFrameModel(BaseModel):
+    label: str
+    timestamp: float
+    shape: List[int]
+    n_fft: int
+    hop_length: int
+    sample_rate: int
+    pmin: float
+    pmax: float
+    data: List[List[List[float]]]
 
 # ---------- Endpoints ----------
 @router.get("/run", tags=["pipeline"])
@@ -458,3 +566,32 @@ def get_latest_doa():
 def ingest_doa(doa: DoaResultModel = Body(...)):
     doa_hub.set_last(doa.dict())
     return {"ok": True}
+
+
+@router.post("/spec/ingest", status_code=202)
+def ingest_spec(frame: SpecFrameModel = Body(...)):
+    spec_hub.set_last(frame.model_dump())
+    return {"status": "ok"}
+
+@router.websocket("/ws/spec")
+async def ws_spec(
+    ws: WebSocket,
+    interval_ms: int = Query(200, ge=50, le=5000, description="Período de envío (ms)")
+):
+    await ws.accept()
+    try:
+        last_sent_ts = 0.0
+        while True:
+            await asyncio.sleep(interval_ms / 1000.0)
+            frame = spec_hub.get_last()
+            if not frame:
+                continue
+
+            ts = float(frame.get("timestamp") or 0.0)
+            if ts and ts <= last_sent_ts:
+                continue
+
+            await ws.send_json(frame)
+            last_sent_ts = ts if ts else time.time()
+    except Exception:
+        return
