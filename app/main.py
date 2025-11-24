@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.routers.pipeline_router import router as pipeline_router
 from app.api.routers.spectrum_router import router as spectrum_router
+from app.api.routers.status_bladeRF_router import router as blade_rf
 
 try:
     from dotenv import load_dotenv
@@ -17,6 +18,7 @@ except Exception:
 app = FastAPI(title="Morpheus RF API", version="1.2")
 app.include_router(pipeline_router)
 app.include_router(spectrum_router)
+app.include_router(blade_rf)
 
 # CORS
 app.add_middleware(

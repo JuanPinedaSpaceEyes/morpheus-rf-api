@@ -7,6 +7,8 @@ RUN apt-get update && apt-get install -y \
     bladerf \
 && rm -rf /var/lib/apt/lists/*
 
+ENV LD_LIBRARY_PATH=/usr/lib:/usr/local/lib
+
 # === Crear el entorno de trabajo ===
 WORKDIR /app
 
