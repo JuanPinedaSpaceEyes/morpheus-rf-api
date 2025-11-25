@@ -18,3 +18,4 @@ plots/
 .env
 .env.*
 .idea/
+.plots_dual_bladerf/
