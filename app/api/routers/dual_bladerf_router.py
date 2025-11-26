@@ -11,8 +11,8 @@ router = APIRouter(prefix="/rfCaptureDualBladerf", tags=["rfCaptureDualBladerf"]
 class ConfigBladeRF(BaseModel):
     serial_one: str
     serial_two: str
-    center_freq_bladeOne: float  # en GHz (ej: 2.4)
-    center_freq_bladeTwo: float  # en GHz (ej: 5.8)
+    center_freq_bladeOne: float
+    center_freq_bladeTwo: float
     gain_db: int
 
 dual_bladerf_service: Optional[DualBladeRFService] = None

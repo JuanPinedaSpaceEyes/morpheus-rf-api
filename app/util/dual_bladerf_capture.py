@@ -38,13 +38,7 @@ class DualBladeRFService:
         sample_rate: float,
         gain_db: int,
     ):
-        """
-        Servicio para controlar dos bladeRF:
-        - Uno centrado en center_freq_24 (por ejemplo 2.4 GHz)
-        - Otro centrado en center_freq_58 (por ejemplo 5.8 GHz)
-        """
 
-        # --- Configuración base ---
         self.serial_24 = serial_24.strip()
         self.serial_58 = serial_58.strip()
         self.center_freq_24 = center_freq_24  # Hz
@@ -86,10 +80,6 @@ class DualBladeRFService:
     # ------------------------------------------------------------------
 
     def init_devices(self) -> None:
-        """
-        Abre los dos bladeRF por serial/prefijo y configura sus canales RX.
-        NO arranca la captura todavía.
-        """
         if self.dev_24 is not None and self.dev_58 is not None:
             print("[DualBladeRFService] Devices already initialized.")
             return
@@ -166,10 +156,6 @@ class DualBladeRFService:
         gain_db: int,
         channel_index: int = 0,
     ):
-        """
-        Configura parámetros del canal RX (frecuencia, Fs, BW, ganancia).
-        NO configura el streaming síncrono ni habilita el canal.
-        """
         rx_ch = dev.Channel(_bladerf.CHANNEL_RX(channel_index))
 
         print(
@@ -205,10 +191,6 @@ class DualBladeRFService:
     # ------------------------------------------------------------------
 
     def start_capture(self) -> None:
-        """
-        Configura el streaming síncrono en ambos dispositivos, habilita
-        los canales RX y lanza los hilos de recepción y de guardado de gráficas.
-        """
         if self.running:
             print("[DualBladeRFService] Capture already running.")
             return
@@ -258,10 +240,6 @@ class DualBladeRFService:
         print("[DualBladeRFService] Capture started (with plotting).")
 
     def stop_capture(self) -> None:
-        """
-        Señala a los hilos que se detengan, espera a que terminen y deshabilita
-        los canales RX. NO cierra los dispositivos (se dejan abiertos).
-        """
         if not self.running:
             print("[DualBladeRFService] Capture is not running.")
             return

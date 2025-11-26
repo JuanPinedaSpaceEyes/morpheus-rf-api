@@ -33,6 +33,19 @@ if str(ROOT) not in sys.path:
 from app.api.routers.pipeline_router import psd_hub, make_psd_frame, pred_hub, doa_hub, spec_hub
 
 # ================================================================================
+# HELPERS PARA DEVINFO / SERIAL
+# ================================================================================
+
+def _devinfo_serial_str(info) -> str:
+    """
+    Devuelve el serial de un DevInfo como string, decodificando bytes si hace falta.
+    """
+    s = getattr(info, "serial", "")
+    if isinstance(s, (bytes, bytearray)):
+        return s.decode("ascii", errors="ignore")
+    return str(s)
+
+# ================================================================================
 # CONFIGURATION
 # ================================================================================
 
@@ -150,15 +163,50 @@ DOA_CONFIG = {
 os.environ.setdefault("LIBUSB_DEBUG", "3")
 os.environ.pop("LIBUSB_DEBUG", None)
 DEV_ID = os.getenv("BLADERF_DEVICE")
+DEVICE_NAME = os.getenv("PIPELINE_DEVICE_NAME", DEV_ID or "default_blade")
 
-try:
-    if DEV_ID:
-        sdr = _bladerf.BladeRF(DEV_ID)
-    else:
-        sdr = _bladerf.BladeRF()
-    print(f"[SDR] BladeRF device initialized successfully")
-except _bladerf.NoDevError:
-    print("[SDR] No se encontraron dispositivos bladeRF desde este proceso.")
+
+def _open_bladerf_from_env(dev_id: str | None):
+    """
+    Abre un bladeRF usando BLADERF_DEVICE como PREFIJO de serial.
+    Si dev_id es None → abre el primer dispositivo disponible.
+    """
+    try:
+        devinfos = _bladerf.get_device_list()
+    except Exception as e:
+        print(f"[SDR] Error llamando a get_device_list(): {e}")
+        sys.exit(2)
+
+    if not devinfos:
+        print("[SDR] No se encontraron dispositivos bladeRF en get_device_list().")
+        try:
+            out = subprocess.run(["bladeRF-cli", "-p"], capture_output=True, text=True)
+            print("[SDR] bladeRF-cli -p stdout:\n", out.stdout)
+            print("[SDR] bladeRF-cli -p stderr:\n", out.stderr)
+        except Exception as e:
+            print("[SDR] No pude ejecutar bladeRF-cli -p:", e)
+        sys.exit(2)
+
+    if not dev_id:
+        sys.exit(1)
+
+    serial_prefix = dev_id.strip()
+    print(f"[SDR] BLADERF_DEVICE='{serial_prefix}', buscando por prefijo de serial...")
+
+    for info in devinfos:
+        serial_str = _devinfo_serial_str(info)
+        print(f"   - encontrado dispositivo con serial={serial_str}")
+        if serial_str.startswith(serial_prefix):
+            print(f"[SDR] Abriendo bladeRF con serial que empieza por '{serial_prefix}'")
+            try:
+                dev = _bladerf.BladeRF(devinfo=info)
+                print(f"[SDR] Dispositivo abierto: {dev}")
+                return dev
+            except Exception as e:
+                print(f"[SDR] Error abriendo dispositivo con ese serial: {e}")
+                sys.exit(1)
+
+    print(f"[SDR] No se encontró ningún dispositivo cuyo serial empiece por '{serial_prefix}'")
     try:
         out = subprocess.run(["bladeRF-cli", "-p"], capture_output=True, text=True)
         print("[SDR] bladeRF-cli -p stdout:\n", out.stdout)
@@ -166,6 +214,17 @@ except _bladerf.NoDevError:
     except Exception as e:
         print("[SDR] No pude ejecutar bladeRF-cli -p:", e)
     sys.exit(2)
+
+try:
+    sdr = _open_bladerf_from_env(DEV_ID)
+    print("[SDR] BladeRF device initialized successfully")
+except SystemExit:
+    raise
+except Exception as e:
+    print(f"[SDR] Error inesperado inicializando bladeRF: {e}")
+    import traceback
+    traceback.print_exc()
+    sys.exit(1)
 
 # ================================================================================
 # MODEL LOADING
@@ -338,11 +397,15 @@ def two_stage_predict(binary_model, multiclass_model, spectrogram, binary_thresh
 
 # ------- Visualization -------------------------------------------------------
 def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
-                          n_fft=512, win_length=512, hop_length=5860,
+                          blade_id: str,n_fft=512, win_length=512, hop_length=5860,
                           sample_freq=40e6, pmin: float = None, pmax: float = None,
                           show_stats: bool = True, figsize: tuple = (16, 4)) -> None:
     """Visualize a spectrogram with I and Q channels or a Power spectrogram."""
     # Determine layout based on spectrogram shape
+    if blade_id is None:
+        blade_id = DEVICE_NAME
+
+
     if spectrogram.ndim == 3:
         if spectrogram.shape[0] == 2:
             ch_names = {0: "I Spectrogram", 1: "Q Spectrogram"}
@@ -351,7 +414,7 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
             axes.spines['bottom'].set_color('white')
             axes.spines['left'].set_color('white')
             fig.patch.set_alpha(0)
-            fig.suptitle(f'{class_name}')
+            fig.suptitle(f'{class_name} | {blade_id} ' )
         elif spectrogram.shape[0] == 1:
             ch_names = {0: f"Power Spectrogram"}
             fig, axes = plt.subplots(1, 1, figsize=figsize)
@@ -360,13 +423,14 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
             axes.spines['left'].set_color('white')
             axes = [axes]  # Make it iterable
             fig.patch.set_alpha(0)
+            fig.suptitle(f'{blade_id}')
         else:
             raise ValueError(f"Spectrogram shape {spectrogram.shape} doesn't match expected dimensions")
     else:
         raise ValueError(f"Expected 3D spectrogram, got shape {spectrogram.shape}")
 
     print(f"[Visualización] Forma del espectrograma: {spectrogram.shape}")
-    print(f"[Visualización] Clase: {class_name}")
+    print(f"[Visualización] Clase: {class_name} (device={blade_id})")
 
     # Convert to numpy for matplotlib
     spectrogram_np = spectrogram.detach().cpu().numpy()
@@ -391,8 +455,7 @@ def visualize_spectrogram(spectrogram: torch.Tensor, class_name: str,
 
     # Ensure frequency axis matches spectrogram dimensions
     if len(freqs_in_mhz) != n_freq_bins:
-        print(
-            f"[Visualización] Advertencia: Desajuste en bins de frecuencia. Esperados {n_freq_bins}, obtenidos {len(freqs_in_mhz)}")
+        print(f"[Visualización] Advertencia: Desajuste en bins de frecuencia. Esperados {n_freq_bins}, obtenidos {len(freqs_in_mhz)}")
         freqs_in_mhz = np.linspace(freqs_in_mhz[0], freqs_in_mhz[-1], n_freq_bins)
 
     t = time_duration_ms  # Time in milliseconds
@@ -623,8 +686,7 @@ try:
 
             print(f"\n[Stage 1 - Binary] {binary_result['class_name']} (conf: {binary_result['confidence']:.4f})")
             if multiclass_result:
-                print(
-                    f"[Stage 2 - Multiclass] {multiclass_result['class_name']} (conf: {multiclass_result['confidence']:.4f})")
+                print(f"[Stage 2 - Multiclass] {multiclass_result['class_name']} (conf: {multiclass_result['confidence']:.4f})")
             print(f"[Final] {drone_predict}")
 
             # Publish with detailed info
@@ -648,9 +710,14 @@ try:
 
             publish_pred(label_name=drone_predict, confidence=confidence)
 
-        # Publish PSD
-        frame = make_psd_frame(x=x, center_hz=center_freq, sample_rate=SDR_CONFIG['sample_rate'],
-                               nfft=1024, drone_id=drone_predict, schema_version="1.0")
+        frame = make_psd_frame(
+            x=x,
+            center_hz=center_freq,
+            sample_rate=SDR_CONFIG['sample_rate'],
+            nfft=1024,
+            drone_id=drone_predict,
+            schema_version="1.0",
+        )
         publish_psd(x, center_freq, SDR_CONFIG['sample_rate'], nfft=1024, drone_id=drone_predict)
 
         try:
@@ -665,6 +732,7 @@ try:
         visualize_spectrogram(
             spectrogram=spec.unsqueeze(0),
             class_name=f"{drone_predict}",
+            blade_id = DEVICE_NAME,
             **VIS_CONFIG
         )
 
@@ -764,15 +832,6 @@ try:
             ax.grid(True)
             plt.tight_layout()
 
-            # if SAVE_PLOTS:
-            #     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            #     out_path = PLOT_DIR / f"direction_{ts}.png"
-            #     plt.savefig(out_path, dpi=120)
-            #     print(f"[DOA] Polar plot guardado: {out_path}")
-            # plt.show()
-
-        # ============ FREQUENCY HOPPING ============
-        # Update frequency for next iteration
         if center_freq >= SDR_CONFIG['max_freq']:
             center_freq = SDR_CONFIG['max_freq']
             direction = -1

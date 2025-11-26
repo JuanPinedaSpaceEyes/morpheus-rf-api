@@ -16,7 +16,7 @@ import time
 import threading
 import math
 import numpy as np
-
+from dataclasses import dataclass
 
 router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
@@ -42,7 +42,75 @@ class _State:
 
 state = _State()
 
+
+@dataclass
+class PipelineProcInfo:
+    name: str
+    dev_id: Optional[str]
+    proc: subprocess.Popen
+    started_at: float
+    log_file: Path
+
+class RunDeviceModel(BaseModel):
+    name: str = Field(..., description="ID interno: '24', '58', 'blade_1', etc.")
+    dev_id: Optional[str] = Field(
+        None,
+        description="Valor para BLADERF_DEVICE (serial/ID del bladeRF). Si es None, pipeline.py eligirá el primero disponible.",
+    )
+
+
+class _MultiState:
+    def __init__(self):
+        self.procs: Dict[str, PipelineProcInfo] = {}
+        self.lock = threading.Lock()
+
+multi_state = _MultiState()
+
 # ---------- Helpers ----------
+
+# ---------- Helpers comunes ----------
+def _spawn_pipeline_process(
+    *,
+    name: str,
+    dev_id: Optional[str],
+    extra_args: Optional[List[str]] = None,
+    log_prefix: str = "pipeline",
+) -> Dict[str, Any]:
+
+    if not PIPELINE_PATH.exists():
+        raise HTTPException(500, f"pipeline.py no existe en {PIPELINE_PATH}")
+
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{name}" if name else ""
+    log_path = LOG_DIR / f"{log_prefix}{suffix}_{ts}.log"
+    log_f = open(log_path, "a", buffering=1)
+
+    cmd: List[str] = [PYTHON_BIN, "-u", str(PIPELINE_PATH)]
+    if extra_args:
+        cmd += extra_args
+
+    env = os.environ.copy()
+    if dev_id:
+        env["BLADERF_DEVICE"] = dev_id
+    if name:
+        env["PIPELINE_DEVICE_NAME"] = name
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(CWD),
+        env=env,
+        stdout=log_f,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+
+    return {
+        "proc": proc,
+        "cmd": cmd,
+        "log_path": log_path,
+    }
+
+# ---------- Modo single (legacy) ----------
 def _start_pipeline(args: Optional[List[str]] = None):
     if not PIPELINE_PATH.exists():
         raise HTTPException(500, f"pipeline.py no existe en {PIPELINE_PATH}")
@@ -122,6 +190,101 @@ def _stop(timeout: float = 5.0):
         pid = state.proc.pid
         state.proc = None
         return {"status": "stopped", "pid": pid, "returncode": rc}
+
+    # ---------- Modo multi-proceso: 1 pipeline por bladeRF ----------
+def _start_pipeline_for(
+    name: str,
+    dev_id: Optional[str],
+) -> Dict[str, Any]:
+
+    if not name:
+        raise HTTPException(400, "name no puede ser vacío")
+
+    with multi_state.lock:
+        # Si ya existe y sigue vivo, no lo duplicamos
+        existing = multi_state.procs.get(name)
+        if existing and existing.proc.poll() is None:
+            raise HTTPException(
+                409,
+                f"El pipeline '{name}' ya está corriendo (pid={existing.proc.pid}).",
+            )
+
+        spawned = _spawn_pipeline_process(
+            name=name,
+            dev_id=dev_id,
+            log_prefix="pipeline",
+        )
+
+        proc: subprocess.Popen = spawned["proc"]
+        log_path: Path = spawned["log_path"]
+        cmd = spawned["cmd"]
+
+        info = PipelineProcInfo(
+            name=name,
+            dev_id=dev_id,
+            proc=proc,
+            started_at=time.time(),
+            log_file=log_path,
+        )
+        multi_state.procs[name] = info
+
+        return {
+            "status": "started",
+            "name": name,
+            "dev_id": dev_id,
+            "pid": proc.pid,
+            "log_file": str(log_path),
+            "cwd": str(CWD),
+            "cmd": cmd,
+        }
+
+
+def _status_all() -> Dict[str, Any]:
+    with multi_state.lock:
+        out: Dict[str, Any] = {}
+        for name, info in multi_state.procs.items():
+            running = info.proc.poll() is None
+            rc = info.proc.poll()
+            out[name] = {
+                "running": running,
+                "pid": info.proc.pid,
+                "returncode": rc,
+                "dev_id": info.dev_id,
+                "uptime_sec": None
+                if not running
+                else int(time.time() - info.started_at),
+                "log_file": str(info.log_file),
+            }
+        return out
+
+
+def _stop_one(name: str, timeout: float = 5.0) -> Dict[str, Any]:
+    with multi_state.lock:
+        info = multi_state.procs.get(name)
+        if not info or info.proc.poll() is not None:
+            return {"status": "not_running", "name": name}
+
+        info.proc.terminate()
+        try:
+            info.proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            info.proc.kill()
+
+        rc = info.proc.poll()
+        pid = info.proc.pid
+        del multi_state.procs[name]
+        return {"status": "stopped", "name": name, "pid": pid, "returncode": rc}
+
+
+def _stop_all(timeout: float = 5.0) -> Dict[str, Any]:
+    results: Dict[str, Any] = {}
+    with multi_state.lock:
+        names = list(multi_state.procs.keys())
+    for name in names:
+        results[name] = _stop_one(name=name, timeout=timeout)
+    return results
+
+
 
 class PsdFrameModel(BaseModel):
     start_hz: float = Field(..., description="Frecuencia de inicio del primer bin (Hz, absoluta)")
@@ -411,6 +574,32 @@ def logs_get(tail_kb: int = Query(1024, ge=1, le=1024)):
 def stop_post(timeout_sec: float = Query(5.0, ge=1.0, le=60.0)):
     return _stop(timeout=timeout_sec)
 
+@router.post("/run-device", tags=["pipeline"])
+def run_device(body: RunDeviceModel):
+    return _start_pipeline_for(
+        name=body.name,
+        dev_id=body.dev_id
+    )
+
+@router.get("/status-all", tags=["pipeline"])
+def status_all():
+    return _status_all()
+
+
+@router.post("/stop-device", tags=["pipeline"])
+def stop_device(
+        name: str = Query(..., description="ID interno del pipeline (ej: '24', '58')"),
+        timeout_sec: float = Query(5.0, ge=1.0, le=60.0),
+):
+    return _stop_one(name=name, timeout=timeout_sec)
+
+
+@router.post("/stop-all", tags=["pipeline"])
+def stop_all(
+        timeout_sec: float = Query(5.0, ge=1.0, le=60.0),
+):
+    return _stop_all(timeout=timeout_sec)
+
 @router.websocket("/ws/psd")
 async def ws_psd(
     ws: WebSocket,
@@ -595,3 +784,4 @@ async def ws_spec(
             last_sent_ts = ts if ts else time.time()
     except Exception:
         return
+
