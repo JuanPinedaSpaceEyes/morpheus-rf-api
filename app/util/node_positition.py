@@ -1,6 +1,11 @@
 # app/gps_capture.py
+from __future__ import annotations
+
 import time
+from typing import List, Optional
+
 import serial
+from serial.tools import list_ports
 import pynmea2
 
 # ===== CONFIG =====
@@ -15,11 +20,78 @@ DEFAULT_STATUS_EVERY_S = 2         # progress while waiting for fix
 # ==================
 
 
+def _list_serial_ports() -> List[dict]:
+    ports: List[dict] = []
+    for p in list_ports.comports():
+        ports.append(
+            {
+                "device": p.device,
+                "description": p.description,
+                "hwid": p.hwid,
+                "vid": getattr(p, "vid", None),
+                "pid": getattr(p, "pid", None),
+            }
+        )
+    return ports
+
+
+def _looks_like_gps_port(info: dict) -> bool:
+
+    dev = info["device"]
+    desc = (info.get("description") or "").lower()
+    hwid = (info.get("hwid") or "").lower()
+
+
+    gps_keywords = ["gps", "gnss", "u-blox", "ublox"]
+    usb_serial_keywords = ["pl2303", "usb-serial", "usb serial", "cp210", "ch340", "ch341"]
+
+    if any(k in desc for k in gps_keywords):
+        return True
+    if any(k in desc for k in usb_serial_keywords):
+        return True
+    if "gps" in hwid or "gnss" in hwid:
+        return True
+
+
+    if dev.startswith("/dev/ttyUSB") or dev.startswith("/dev/ttyACM") or dev.startswith("/dev/cu."):
+        return True
+    if dev.upper().startswith("COM"):
+        return True
+
+    return False
+
+
+def detect_gps_ports(
+    baud: int = DEFAULT_BAUD,
+    sniff_time_s: float = 3.0,
+    read_timeout_s: float = 0.5,
+) -> List[str]:
+    candidates = [p for p in _list_serial_ports() if _looks_like_gps_port(p)]
+    gps_ports: List[str] = []
+
+    for info in candidates:
+        dev = info["device"]
+        try:
+            with serial.Serial(dev, baud, timeout=read_timeout_s) as ser:
+                start = time.time()
+                while time.time() - start < sniff_time_s:
+                    line = ser.readline().decode("ascii", errors="ignore").strip()
+                    if not line:
+                        continue
+
+                    if line.startswith("$") and any(
+                        tag in line for tag in ("GGA", "RMC", "GLL", "GSA", "GSV")
+                    ):
+                        print(f"[DETECT] {dev} parece GPS (NMEA: {line[:30]}...)")
+                        gps_ports.append(dev)
+                        break
+        except (serial.SerialException, OSError):
+            continue
+
+    return gps_ports
+
+
 def extract_fix(msg):
-    """
-    Dado un mensaje pynmea2, devuelve (lat, lon) en grados decimales si
-    el mensaje tiene un fix válido; en caso contrario devuelve None.
-    """
     st = getattr(msg, "sentence_type", "")
 
     # RMC: válido cuando status == 'A'
@@ -40,7 +112,7 @@ def extract_fix(msg):
 
 
 def capture_avg_fix(
-    port: str = DEFAULT_PORT,
+    port: Optional[str] = None,
     baud: int = DEFAULT_BAUD,
     fix_timeout_s: float = DEFAULT_FIX_TIMEOUT_S,
     n_samples: int = DEFAULT_N_SAMPLES,
@@ -48,15 +120,24 @@ def capture_avg_fix(
     sample_spacing_s: float = DEFAULT_SAMPLE_SPACING_S,
     status_every_s: float = DEFAULT_STATUS_EVERY_S,
 ) -> dict:
-    """
-    BLOQUEANTE.
-    Abre el puerto serie, espera un fix GNSS, captura n_samples posiciones
-    y devuelve un dict JSON-friendly con las muestras y el promedio.
-    """
+    if port is None:
+        gps_ports = detect_gps_ports(baud=baud)
+        if not gps_ports:
+            raise RuntimeError(
+                "No se encontró ningún receptor GNSS. Verifica las conexiones USB "
+                "o especifica un puerto manualmente."
+            )
+        if len(gps_ports) > 1:
+            print(f"[INFO] Se encontraron múltiples GPS: {gps_ports}. Usando {gps_ports[0]}")
+        port_to_use = gps_ports[0]
+    else:
+        port_to_use = port
+
+    print(f"[INFO] Usando puerto {port_to_use} a {baud} baudios.")
+
     samples = []
 
-    with serial.Serial(port, baud, timeout=1) as ser:
-        # ---- 1) ESPERAR FIX ----
+    with serial.Serial(port_to_use, baud, timeout=1) as ser:
         start = time.time()
         last_status_print = 0.0
         first_fix = None
@@ -76,7 +157,6 @@ def capture_avg_fix(
 
             fix = extract_fix(msg)
 
-            # Indicador de progreso (fix quality y satélites)
             if getattr(msg, "sentence_type", "") == "GGA":
                 now = time.time()
                 if now - last_status_print > status_every_s:
@@ -98,7 +178,6 @@ def capture_avg_fix(
                 print(f"[READY] lat={lat:.7f}, lon={lon:.7f}")
                 break
 
-        # ---- 2) CAPTURAR N MUESTRAS + PROMEDIO ----
         lat, lon, t0 = first_fix
         samples.append({"lat": lat, "lon": lon, "timestamp": t0})
         last_t = t0
@@ -138,10 +217,7 @@ def capture_avg_fix(
 
     return {
         "avg": {"lat": lat_avg, "lon": lon_avg},
-        "n_samples": len(samples),
-        "port": port,
-        "baud": baud,
-        "samples": samples,
+        "n_samples": len(samples)
     }
 
 
