@@ -16,6 +16,7 @@ import torch
 from torchaudio.transforms import Spectrogram
 from scipy.signal import correlate
 from bladerf import _bladerf
+from collections import Counter, defaultdict
 
 # ================================================================
 # Cargar libbladeRF
@@ -261,7 +262,8 @@ class transform_spectrogram(torch.nn.Module):
         return spec_db
 
 
-def two_stage_predict(binary_model, multiclass_model, spectrogram, binary_threshold=0.5):
+def two_stage_predict(binary_model, multiclass_model, spectrogram, binary_threshold=0.5,
+                      binary_results_list=None, multiclass_results_list=None, window_size=5):
     spec_input = spectrogram.type(torch.float32).unsqueeze(0).unsqueeze(0)
     with torch.no_grad():
         binary_outputs = binary_model(spec_input).view(-1)
@@ -277,10 +279,15 @@ def two_stage_predict(binary_model, multiclass_model, spectrogram, binary_thresh
         "raw_prob": binary_probs.item(),
     }
 
-    multiclass_result = None
-    final_class_name = binary_class_name
+    _, binary_result_smoothed, binary_results_list = smooth_predictions(
+        binary_result, binary_results_list, window_size, adaptive=True
+    )
 
-    if binary_class_name == "Drone":
+    multiclass_result = None
+    multiclass_result_smoothed = None
+    final_class_name = binary_result_smoothed['class_name']
+
+    if binary_result_smoothed['class_name'] == 'Drone':
         with torch.no_grad():
             multiclass_outputs = multiclass_model(spec_input)
             multiclass_probs = torch.softmax(multiclass_outputs, dim=1)
@@ -295,9 +302,148 @@ def two_stage_predict(binary_model, multiclass_model, spectrogram, binary_thresh
             "class_idx": multiclass_class_idx,
             "all_probs": multiclass_probs[0].cpu().numpy().tolist(),
         }
-        final_class_name = multiclass_class_name
 
-    return final_class_name, binary_result, multiclass_result
+        _, multiclass_result_smoothed, multiclass_results_list = smooth_predictions(
+            multiclass_result, multiclass_results_list, window_size, adaptive=False
+        )
+
+        final_class_name = multiclass_result_smoothed['class_name']
+
+    else:
+        # Add None to maintain temporal alignment
+        if multiclass_results_list is None:
+            multiclass_results_list = []
+        multiclass_results_list.append(None)
+
+    return (final_class_name, binary_result, binary_result_smoothed,
+            multiclass_result, multiclass_result_smoothed,
+            binary_results_list, multiclass_results_list)
+
+
+# ----------------------------------
+# Moving mode and confidence ponderation prediction
+# -----------------------------------
+def smooth_predictions(result, results_list, window_size=5, adaptive=True, max_history=None):
+    """
+    Perform moving mode prediction over a list of results.
+    Handles None values in history to maintain temporal alignment.
+    Uses adaptive window sizing to respond faster to state changes.
+
+    Args:
+        result: dict with 'class_name' and 'confidence' for current prediction
+        results_list: List of dicts with 'class_name' and 'confidence' (may contain None)
+        window_size: Maximum size of the moving window
+        adaptive: If True, use smaller window when detecting changes
+        max_history: Maximum history length to prevent memory leak (default: window_size * 3)
+
+    Returns:
+        tuple: (original_result, corrected_result, updated_results_list)
+    """
+    if results_list is None:
+        results_list = []
+
+    # Add current result to history
+    results_list.append(result)
+
+    # Trim history to prevent unbounded growth
+    if max_history is None:
+        max_history = window_size * 3  # Keep 3x window size as buffer
+    if len(results_list) > max_history:
+        results_list = results_list[-max_history:]
+
+    # Get recent results window and filter out None values
+    recent_results = results_list[-window_size:]
+    valid_results = [r for r in recent_results if r is not None]
+
+    # Minimum valid predictions required for smoothing
+    MIN_VALID_PREDICTIONS = 2
+    if len(valid_results) < MIN_VALID_PREDICTIONS:
+        return result, result.copy(), results_list
+
+    # Adaptive window: detect if current prediction differs from recent consensus
+    # ONLY apply if adaptive=True (binary stage uses this, multiclass doesn't)
+    effective_window_used = len(valid_results)  # Track actual window size used
+
+    if adaptive and len(valid_results) >= 2:
+        # Calculate weighted consensus from history (EXCLUDING current prediction)
+        prev_results = valid_results[:-1]
+        prev_scores = defaultdict(float)
+
+        for idx, res in enumerate(prev_results):
+            class_name = res['class_name']
+            confidence = res['confidence']
+            # Use same weighting as main scoring
+            recency_weight = min((idx + 1) / len(prev_results), 0.85)
+            prev_scores[class_name] += confidence * recency_weight
+
+        # Get weighted consensus
+        if prev_scores:
+            prev_consensus = max(prev_scores, key=prev_scores.get)
+            current_class = result['class_name']
+
+            # If current differs from weighted consensus, use smaller window
+            if current_class != prev_consensus:
+                effective_window_size = min(3, window_size)
+                recent_results = results_list[-effective_window_size:]
+                valid_results = [r for r in recent_results if r is not None]
+                effective_window_used = len(valid_results)
+
+                # Re-check minimum after window reduction
+                if len(valid_results) < MIN_VALID_PREDICTIONS:
+                    return result, result.copy(), results_list
+
+    # Calculate weighted scores for each class (use valid_results directly)
+    class_scores = defaultdict(float)
+
+    for idx, res in enumerate(valid_results):
+        class_name = res['class_name']
+        confidence = res['confidence']
+
+        # Recency weight: more recent = higher weight
+        recency_weight = min((idx + 1) / len(valid_results), 0.85)
+
+        # Combined score: confidence * recency
+        class_scores[class_name] += confidence * recency_weight
+
+    scores_str = ", ".join([f"{k}: {v:.4f}" for k, v in class_scores.items()])
+    print(f"[Suavizado] {scores_str}")
+
+    # Find class with highest combined score
+    if class_scores:
+        best_class = max(class_scores, key=class_scores.get)
+
+        # Calculate average confidence for the best class only
+        # Filter predictions that match best_class
+        best_class_predictions = [r for r in valid_results if r['class_name'] == best_class]
+
+        if best_class_predictions:
+            # Weighted average of confidences for winning class
+            weighted_conf_sum = 0
+            weight_sum = 0
+            for idx, res in enumerate(valid_results):
+                if res['class_name'] == best_class:
+                    recency_weight = min((idx + 1) / len(valid_results), 0.85)
+                    weighted_conf_sum += res['confidence'] * recency_weight
+                    weight_sum += recency_weight
+
+            # This is the weighted average confidence for the winning class
+            normalized_confidence = weighted_conf_sum / weight_sum if weight_sum > 0 else 0
+        else:
+            normalized_confidence = 0
+
+        result_corrected = {
+            'class_name': best_class,
+            'confidence': normalized_confidence,  # Now properly in [0, 1]
+            'raw_confidence': result['confidence'],  # Original model confidence
+            'raw_prob': result.get('raw_prob'),
+            'all_probs': result.get('all_probs'),
+            'raw_score': class_scores[best_class],  # Unnormalized score for debugging
+            'window_size_used': effective_window_used
+        }
+    else:
+        result_corrected = result.copy()
+
+    return result, result_corrected, results_list
 
 
 def visualize_spectrogram(
@@ -561,6 +707,9 @@ def run_pipeline(
 
     print(f"[Pipeline] Iniciando recepción ({blade_name}) (Two-stage: {TWO_STAGE_PREDICTION})")
 
+    # Initialize prediction history lists
+    binary_results_list = []
+    multiclass_results_list = []
     try:
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -606,14 +755,27 @@ def run_pipeline(
 
             # === Predicción ===
             if TWO_STAGE_PREDICTION:
-                drone_predict, binary_result, multiclass_result = two_stage_predict(
-                    binary_model, multiclass_model, spec, BINARY_CONFIDENCE_THRESHOLD
+                (final_class_name,
+                 binary_result, binary_result_smoothed,
+                 multiclass_result, multiclass_result_smoothed,
+                 binary_results_list, multiclass_results_list) = two_stage_predict(
+                    binary_model, multiclass_model, spec, BINARY_CONFIDENCE_THRESHOLD,
+                    binary_results_list, multiclass_results_list
                 )
                 print(
                     f"\n[{blade_name}] [Stage 1] {binary_result['class_name']} "
                     f"(conf={binary_result['confidence']:.4f})"
                 )
+
+                drone_predict_raw = binary_result['class_name']
+                drone_confidence_raw = binary_result['confidence']
+                drone_predict = binary_result_smoothed['class_name']  # Update final class name if smoothed
+                drone_confidence = binary_result_smoothed['confidence']
                 if multiclass_result:
+                    drone_predict_raw = multiclass_result['class_name']
+                    drone_confidence_raw = multiclass_result['confidence']
+                    drone_predict = multiclass_result_smoothed['confidence']
+                    drone_confidence = multiclass_result_smoothed['class_name']  # Update final class name if smoothed
                     print(
                         f"[{blade_name}] [Stage 2] {multiclass_result['class_name']} "
                         f"(conf={multiclass_result['confidence']:.4f})"
@@ -622,9 +784,16 @@ def run_pipeline(
 
                 publish_pred(
                     label_name=drone_predict,
-                    confidence=multiclass_result["confidence"] if multiclass_result else binary_result["confidence"],
-                    binary_info=binary_result,
-                    multiclass_info=multiclass_result,
+                    confidence=drone_confidence,
+                    binary_info=binary_result_smoothed,
+                    multiclass_info=multiclass_result_smoothed,
+                )
+
+                visualize_spectrogram(
+                    spectrogram=spec.unsqueeze(0),
+                    class_name=f"Pred: {drone_predict_raw}({drone_confidence_raw:}) - Smoothed: {drone_predict}({drone_confidence:})",
+                    blade_id=blade_name,
+                    **VIS_CONFIG,
                 )
             else:
                 with torch.no_grad():
@@ -652,12 +821,7 @@ def run_pipeline(
                 print("[pipeline] publish_spec error:", e)
 
             # === Guardar imagen del espectrograma ===
-            visualize_spectrogram(
-                spectrogram=spec.unsqueeze(0),
-                class_name=drone_predict,
-                blade_id=blade_name,
-                **VIS_CONFIG,
-            )
+
 
             # === DOA (solo si no es Noise/Jammer) ===
             if drone_predict not in ["Noise", "Jammer"]:
