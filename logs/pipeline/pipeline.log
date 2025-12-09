@@ -1,0 +1,339 @@
+[Logging] Capturando TODO stdout/stderr del proceso en: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/logs/pipeline/pipeline.log
+[Model] Modelo binario cargado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_BIN-UNF1-(IQSignal_DroneDetectSNR).pt
+[Model] Modelo multiclase cargado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_MC-UNF5-(IQSig_DroneDetectSNR).pt
+[32mINFO[0m:     Started server process [[36m7774[0m]
+[32mINFO[0m:     Waiting for application startup.
+[32mINFO[0m:     Application startup complete.
+[32mINFO[0m:     Uvicorn running on [1mhttp://127.0.0.1:8000[0m (Press CTRL+C to quit)
+[Pipeline] run_pipeline(dev_id=7b1b9ce290114baaab24bb18a37507c2, name=blade_1)
+[32mINFO[0m:     127.0.0.1:50962 - "[1mPOST /pipeline/run-device HTTP/1.1[0m" [32m200 OK[0m
+[Pipeline] Frecuencias de escaneo: 2410000000, 2430000000, 2450000000, 2470000000
+[SDR] BLADERF_DEVICE='7b1b9ce290114baaab24bb18a37507c2', buscando por prefijo de serial...
+   - encontrado dispositivo con serial=7b1b9ce290114baaab24bb18a37507c2
+[SDR] Abriendo bladeRF con serial que empieza por '7b1b9ce290114baaab24bb18a37507c2'
+[SDR] Dispositivo abierto: <BladeRF(<DevInfo(libusb:device=0:1 instance=0 serial=7b1b9ce290114baaab24bb18a37507c2)>)>
+[Pipeline] Iniciando recepción (blade_1) (Two-stage: True)
+
+[blade_1] MODO=SCAN FRECUENCIA: 2410000000 Hz
+
+[blade_1] [Stage 1] Noise (conf=0.9999)
+[blade_1] [Final] Noise (conf=0.9999)
+[32mINFO[0m:     127.0.0.1:50963 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-43.51, Max=10.23, Mean=-15.51, Std=4.43
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135613_271250.png
+[32mINFO[0m:     127.0.0.1:50964 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50965 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 1.072 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2430000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9503)
+[blade_1] [Final] Noise (conf=0.9503)
+[32mINFO[0m:     127.0.0.1:50966 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-49.18, Max=7.91, Mean=-15.34, Std=4.37
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135614_228730.png
+[32mINFO[0m:     127.0.0.1:50967 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50968 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.947 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2450000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9995)
+[blade_1] [Final] Noise (conf=0.9995)
+[32mINFO[0m:     127.0.0.1:50969 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-42.60, Max=8.36, Mean=-15.46, Std=4.57
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135615_176153.png
+[32mINFO[0m:     127.0.0.1:50970 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50971 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.948 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2470000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9998)
+[blade_1] [Final] Noise (conf=0.9998)
+[32mINFO[0m:     127.0.0.1:50972 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-41.86, Max=6.07, Mean=-15.52, Std=4.58
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135616_103542.png
+[32mINFO[0m:     127.0.0.1:50973 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50974 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.924 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2410000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9928)
+[blade_1] [Final] Noise (conf=0.9928)
+[32mINFO[0m:     127.0.0.1:50975 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-47.25, Max=7.30, Mean=-15.49, Std=4.38
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135617_012916.png
+[32mINFO[0m:     127.0.0.1:50976 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50977 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.908 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2430000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9976)
+[blade_1] [Final] Noise (conf=0.9976)
+[32mINFO[0m:     127.0.0.1:50978 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-44.56, Max=5.65, Mean=-15.50, Std=4.36
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135617_922340.png
+[32mINFO[0m:     127.0.0.1:50979 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50980 - "[1mGET /pipeline/status-all HTTP/1.1[0m" [32m200 OK[0m
+[32mINFO[0m:     127.0.0.1:50981 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.925 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2450000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9995)
+[blade_1] [Final] Noise (conf=0.9995)
+[32mINFO[0m:     127.0.0.1:50982 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-42.67, Max=8.00, Mean=-15.30, Std=4.55
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135618_924604.png
+[32mINFO[0m:     127.0.0.1:50983 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50984 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.988 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2470000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9997)
+[blade_1] [Final] Noise (conf=0.9997)
+[32mINFO[0m:     127.0.0.1:50985 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-46.51, Max=6.49, Mean=-15.51, Std=4.54
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135619_845996.png
+[32mINFO[0m:     127.0.0.1:50986 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50987 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.921 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2410000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9993)
+[blade_1] [Final] Noise (conf=0.9993)
+[32mINFO[0m:     127.0.0.1:50988 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-43.79, Max=9.99, Mean=-15.38, Std=4.62
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135620_762936.png
+[32mINFO[0m:     127.0.0.1:50989 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50990 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.919 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2430000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9916)
+[blade_1] [Final] Noise (conf=0.9916)
+[32mINFO[0m:     127.0.0.1:50991 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-44.63, Max=7.91, Mean=-15.25, Std=4.51
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135621_700997.png
+[32mINFO[0m:     127.0.0.1:50992 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50993 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.937 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2450000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9999)
+[blade_1] [Final] Noise (conf=0.9999)
+[32mINFO[0m:     127.0.0.1:50994 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-46.18, Max=8.73, Mean=-15.55, Std=4.47
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135622_642636.png
+[32mINFO[0m:     127.0.0.1:50995 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50996 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.944 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2470000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.9999)
+[blade_1] [Final] Noise (conf=0.9999)
+[32mINFO[0m:     127.0.0.1:50997 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-43.14, Max=9.11, Mean=-15.51, Std=4.58
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135623_587988.png
+[32mINFO[0m:     127.0.0.1:50998 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:50999 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] Tiempo de procesamiento: 0.945 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2410000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Drone (conf=0.7344)
+[blade_1] [Stage 2] DJI Mavic Pro 2 (conf=0.5047)
+[blade_1] [Final] DJI Mavic Pro 2 (conf=0.7344)
+[32mINFO[0m:     127.0.0.1:51000 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-41.00, Max=8.72, Mean=-15.57, Std=4.31
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135625_151144.png
+[32mINFO[0m:     127.0.0.1:51001 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:51002 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+[blade_1] [DOA] lag=-1, fase=63.761°
+[32mINFO[0m:     127.0.0.1:51003 - "[1mPOST /pipeline/doa/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/app/ml/pipeline.py:587: RuntimeWarning: divide by zero encountered in matmul
+  R = (Xb.conj().T @ Xb) / max(1, K)
+/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/app/ml/pipeline.py:587: RuntimeWarning: overflow encountered in matmul
+  R = (Xb.conj().T @ Xb) / max(1, K)
+/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/app/ml/pipeline.py:587: RuntimeWarning: invalid value encountered in matmul
+  R = (Xb.conj().T @ Xb) / max(1, K)
+[blade_1] SCAN: detección en 2410000000 Hz (1/2)
+[blade_1] Tiempo de procesamiento: 1.583 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2430000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Noise (conf=0.7314)
+[blade_1] [Final] Noise (conf=0.7314)
+[32mINFO[0m:     127.0.0.1:51004 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-44.39, Max=8.74, Mean=-15.39, Std=4.50
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135626_116978.png
+[32mINFO[0m:     127.0.0.1:51005 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:51006 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] SCAN: detección interrumpida, reseteando contador.
+[blade_1] Tiempo de procesamiento: 0.943 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2450000000 Hz
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+
+[blade_1] [Stage 1] Drone (conf=0.9929)
+[blade_1] [Stage 2] DJI Mini 4K (conf=0.9967)
+[blade_1] [Final] DJI Mini 4K (conf=0.9929)
+[32mINFO[0m:     127.0.0.1:51007 - "[1mPOST /pipeline/pred/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[Visualización] Min=-46.73, Max=9.16, Mean=-14.63, Std=5.14
+[Visualización] Espectrograma guardado: /Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/plots/spectrogram_20251204_135627_771329.png
+[32mINFO[0m:     127.0.0.1:51008 - "[1mPOST /pipeline/psd/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[32mINFO[0m:     127.0.0.1:51009 - "[1mPOST /pipeline/spec/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+libusb: warning [darwin_abort_transfers] aborting all transactions on interface 0 pipe 1
+[WARNING @ host/libraries/libbladeRF/src/backend/usb/libusb.c:1170] Transfer callback occurred out of order. (Warning only this time.)
+[blade_1] [DOA] lag=-24, fase=59.487°
+[32mINFO[0m:     127.0.0.1:51010 - "[1mPOST /pipeline/doa/ingest HTTP/1.1[0m" [32m202 Accepted[0m
+[blade_1] SCAN: detección en 2450000000 Hz (1/2)
+[blade_1] Tiempo de procesamiento: 1.715 s
+
+
+[blade_1] MODO=SCAN FRECUENCIA: 2470000000 Hz
+[WARNING @ host/libraries/libbladeRF/src/streaming/sync_worker.c:422] Timed out while stopping worker. Canceling thread.
+[32mINFO[0m:     Shutting down
+[32mINFO[0m:     Waiting for application shutdown.
+[32mINFO[0m:     Application shutdown complete.
+[32mINFO[0m:     Finished server process [[36m7774[0m]
