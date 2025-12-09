@@ -23,8 +23,9 @@ router = APIRouter(prefix="/pipeline", tags=["pipeline"])
 
 # ---------- Config ----------
 PIPELINE_PATH = Path(__file__).resolve().parents[2] / "ml" / "pipeline.py"
-LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "/tmp/morpheus_pipeline"))
+LOG_DIR = Path(os.getenv("PIPELINE_LOG_DIR", "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/logs/pipeline"))
 LOG_DIR.mkdir(parents=True, exist_ok=True)
+LOG_FILE = LOG_DIR / os.getenv("PIPELINE_LOG_FILE", "pipeline.log")
 CWD = Path(os.getenv("PIPELINE_CWD", str(PIPELINE_PATH.parent)))
 LAST_SPEC_PATH = Path(os.getenv("PIPELINE_LAST_SPEC", "/tmp/morpheus_pipeline/last_spectrogram.png"))
 LAST_DOA_PATH = Path(os.getenv("PIPELINE_LAST_DOA", "/tmp/morpheus_pipeline/last_doa.png"))
@@ -282,6 +283,27 @@ class DoaResultModel(BaseModel):
 
 class PredResultModel(BaseModel):
     label: str = Field(..., description="Nombre de la clase predicha")
+    confidence: Optional[float] = Field(
+        None, description="Confianza principal asociada a la detección (0-1, opcional)"
+    )
+    timestamp: Optional[float] = Field(
+        None, description="Tiempo de la predicción en segundos desde epoch (opcional)"
+    )
+    prediction_mode: Optional[str] = Field(
+        None, description="Modo de predicción ('two_stage' o 'single_stage')"
+    )
+    center_freq: Optional[float] = Field(
+        None, description="Frecuencia central (Hz) usada en la captura que generó esta predicción"
+    )
+    mode: Optional[str] = Field(
+        None, description="Modo del pipeline durante esta predicción: 'scan' o 'track'"
+    )
+    binary: Optional[Dict[str, Any]] = Field(
+        None, description="Detalle del clasificador binario (si aplica)"
+    )
+    multiclass: Optional[Dict[str, Any]] = Field(
+        None, description="Detalle del clasificador multiclase (si aplica)"
+    )
 
 
 class _PredHub:
@@ -474,9 +496,9 @@ def status_get():
 
 @router.get("/logs", tags=["pipeline"], response_class=PlainTextResponse)
 def logs_get(tail_kb: int = Query(1024, ge=1, le=1024)):
-    if not state.log_file:
+    if not LOG_FILE.exists():
         return PlainTextResponse("")
-    return PlainTextResponse(_tail_log(state.log_file, tail_kb))
+    return PlainTextResponse(_tail_log(LOG_FILE, tail_kb))
 
 @router.post("/stop", tags=["pipeline"])
 def stop_post(timeout_sec: float = Query(5.0, ge=1.0, le=60.0)):
