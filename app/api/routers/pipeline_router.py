@@ -15,6 +15,7 @@ import numpy as np
 from fastapi import APIRouter, HTTPException, Query, WebSocket, Body
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+from bladerf import _bladerf
 
 # 🔹 Importamos la función que corre el pipeline en este mismo proceso
 from app.ml.pipeline import run_pipeline
@@ -76,6 +77,45 @@ class RunDeviceModel(BaseModel):
         ),
     )
 
+
+# ---------- Helpers para detectar todos los bladeRF conectados ----------
+
+def _devinfo_serial_str(info) -> str:
+
+    s = getattr(info, "serial", "")
+    if isinstance(s, (bytes, bytearray)):
+        return s.decode("ascii", errors="ignore")
+    return str(s)
+
+
+def _detect_bladerf_devices() -> list[dict]:
+    if _bladerf is None:
+        raise HTTPException(
+            status_code=500,
+            detail="El módulo bladerf no está disponible en este backend.",
+        )
+
+    try:
+        devinfos = _bladerf.get_device_list()
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error llamando a bladerf.get_device_list(): {e}",
+        )
+
+    devices = []
+    if not devinfos:
+        return devices
+
+    for info in devinfos:
+        serial = _devinfo_serial_str(info)
+        devices.append(
+            {
+                "serial": serial,
+                "info": repr(info),  # por si quieres ver bus/instancia/etc.
+            }
+        )
+    return devices
 
 # ---------- Helper para logs ----------
 def _tail_log(path: Path, kb: int) -> str:
@@ -510,6 +550,80 @@ def run_device(body: RunDeviceModel):
         name=body.name,
         dev_id=body.dev_id,
     )
+
+@router.post("/run-all-devices", tags=["pipeline"])
+def run_all_devices(
+    name_prefix: str = Query(
+        "blade",
+        description="Prefijo para el name lógico de cada pipeline (ej: 'blade' -> blade_1, blade_2, ...)",
+    ),
+):
+    """
+    Lanza un pipeline por cada bladeRF detectado.
+
+    Para cada dispositivo:
+      - Usa su serial completo como dev_id (lo que consume run_pipeline).
+      - Genera un name lógico tipo 'blade_1', 'blade_2', etc.
+      - Internamente llama a _start_pipeline_for(), que crea el hilo
+        y ejecuta run_pipeline(dev_id=serial, device_name=name, ...).
+
+    Conserva exactamente la misma lógica SCAN/TRACK que ya tienes en run_pipeline,
+    solo que replicada por cada bladeRF.
+    """
+    devices = _detect_bladerf_devices()
+    if not devices:
+        raise HTTPException(
+            status_code=404,
+            detail="No se encontró ningún dispositivo bladeRF conectado.",
+        )
+
+    results: dict[str, dict] = {}
+
+    # Copiamos los nombres ya usados para evitar colisiones
+    with multi_state.lock:
+        used_names = set(multi_state.threads.keys())
+
+    for idx, dev in enumerate(devices, start=1):
+        serial = dev["serial"]
+        # nombre base tipo 'blade_1', 'blade_2', ...
+        base_name = f"{name_prefix}_{idx}"
+        name = base_name
+
+        # Evitar chocar con algún name ya existente
+        suffix = 1
+        while name in used_names:
+            suffix += 1
+            name = f"{base_name}_{suffix}"
+        used_names.add(name)
+
+        try:
+            start_res = _start_pipeline_for(name=name, dev_id=serial)
+            results[name] = {
+                "serial": serial,
+                "status": "started",
+                "detail": start_res,
+            }
+        except HTTPException as e:
+            # Por ejemplo, si ese name ya estaba corriendo (409) o cualquier otro error
+            results[name] = {
+                "serial": serial,
+                "status": "error",
+                "http_status": e.status_code,
+                "detail": e.detail,
+            }
+        except Exception as e:  # fallback por si algo raro revienta
+            results[name] = {
+                "serial": serial,
+                "status": "error",
+                "http_status": 500,
+                "detail": str(e),
+            }
+
+    return {
+        "count": len(devices),
+        "devices": devices,   # lista de {serial, info}
+        "pipelines": results, # mapa name -> {serial, status, detail}
+    }
 
 @router.get("/status-all", tags=["pipeline"])
 def status_all():

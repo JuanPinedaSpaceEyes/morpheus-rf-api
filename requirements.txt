@@ -12,3 +12,5 @@ h5py
 websockets
 requests>=2.32,<3
 paho-mqtt
+pyserial
+adafruit-circuitpython-bno055
