@@ -7,7 +7,10 @@ import time
 import threading
 import shutil
 import subprocess
-from typing import Optional
+from typing import Optional, Dict, List, Any
+from dataclasses import dataclass, field
+import math
+import inspect
 
 import numpy as np
 import requests
@@ -17,6 +20,8 @@ from torchaudio.transforms import Spectrogram
 from scipy.signal import correlate
 from bladerf import _bladerf
 from collections import Counter, defaultdict
+from app.util.orientation import get_orientation
+from app.util.triangulation import estimate_emitter_latlon_enu_ls
 
 # ================================================================
 # Cargar libbladeRF
@@ -69,13 +74,13 @@ MODEL_CONFIGS = {
     "binary": {
         "path": os.getenv(
             "BINARY_MODEL_PATH",
-            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_BIN-UNF1-(IQSignal_DroneDetectSNR).pt",
+            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/model_traced_binary.pt",
         )
     },
     "multiclass": {
         "path": os.getenv(
             "MULTICLASS_MODEL_PATH",
-            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_MC-UNF5-(IQSig_DroneDetectSNR).pt",
+            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/model_traced.pt",
         )
     },
 }
@@ -148,13 +153,13 @@ DOA_CONFIG = {
     "military_green": "#4B9920",
 }
 
-C0 = 299_792_458.0          # velocidad de la luz (m/s)
+C0 = 299_792_458.0  # velocidad de la luz (m/s)
 
-SAMPLE_RATE = 40e6          # Hz
-CENTER_FREQ = 2_440_000_000 # Hz
-GAIN_DB     = 30            # dB  (-15 a 60)
+SAMPLE_RATE = 40e6  # Hz
+CENTER_FREQ = 2_440_000_000  # Hz
+GAIN_DB = 30  # dB  (-15 a 60)
 
-N_FFT   = 512               # tamaño FFT para espectrograma
+N_FFT = 512  # tamaño FFT para espectrograma
 WIN_LEN = 512
 HOP_LEN = 5860
 
@@ -169,14 +174,327 @@ NUM_SAMPLES_DOA = int((DOA_WINDOW_MS / 1000.0) * SAMPLE_RATE)
 NUM_SAMPLES_DOA = max(NUM_SAMPLES_DOA, 4096)  # al menos 4096 muestras
 
 # Geometría ULA 2 antenas
-D_CM  = 6.25           # separación entre antenas en cm
-D_M   = D_CM / 100.0   # en metros
-FC_HZ = 2.44e9         # frecuencia central para DOA
+D_CM = 6.25  # separación entre antenas en cm
+D_M = D_CM / 100.0  # en metros
+FC_HZ = 2.44e9  # frecuencia central para DOA
 
 # DOA / MVDR params
 BLOCK_SIZE_MVDR = 4096
-ANGLES_DEG      = np.linspace(-90, 90, 721)   # malla fina
-DIAG_LOAD       = 1e-3
+ANGLES_DEG = np.linspace(-90, 90, 721)  # malla fina
+DIAG_LOAD = 1e-3
+
+
+NODE_GPS_ALL_CAPTURE_URL = os.getenv(
+    "NODE_GPS_ALL_CAPTURE_URL",
+    "http://127.0.0.1:8000/node/gps/all/capture",
+)
+NODE_GPS_SAMPLES = int(os.getenv("NODE_GPS_SAMPLES", "5"))
+NODE_GPS_REFRESH_S = float(os.getenv("NODE_GPS_REFRESH_S", "3.0"))
+
+PIPELINE_NODE_PORT = os.getenv("PIPELINE_NODE_PORT")  # e.g. NODE_LEFT | NODE_RIGHT
+# Alternativa por lado:
+PIPELINE_NODE_SIDE = (os.getenv("PIPELINE_NODE_SIDE", "") or "").strip().lower()  # left|right
+
+# Si NO llegan 2 nodos o quieres fallback tipo frontend:
+NODE_OFFSET_M = float(os.getenv("NODE_OFFSET_M", "10.0"))  # 10m izquierda / 10m derecha
+
+
+
+# ============================
+# GPS FALLBACK (ubicación "quemada")
+# ============================
+FALLBACK_CITY = os.getenv("FALLBACK_CITY", "Medellín, Colombia")
+FALLBACK_LAT = float(os.getenv("FALLBACK_LAT", "6.244203"))
+FALLBACK_LON = float(os.getenv("FALLBACK_LON", "-75.581212"))
+
+
+# ================================================================
+# Multi-Drone Detection Config
+# ================================================================
+DRONE_TIMEOUT_SEC = float(os.getenv("DRONE_TIMEOUT_SEC", "5.0"))  # Tiempo sin ver un dron para considerarlo "perdido"
+MIN_DETECTIONS_CONFIRM = int(os.getenv("MIN_DETECTIONS_CONFIRM", "2"))  # Detecciones mínimas para confirmar dron
+MULTI_DRONE_INGEST_URL = os.getenv("MULTI_DRONE_INGEST_URL", "http://127.0.0.1:8000/pipeline/drones/ingest")
+
+
+@dataclass
+class DroneDetection:
+    """Representa una detección de dron en una frecuencia específica."""
+    drone_id: str  # ID único del dron (generado)
+    frequency_hz: float  # Frecuencia donde se detectó
+    drone_class: str  # Clase predicha (DJI Mini 4K, etc.)
+    confidence: float  # Confianza de la predicción
+    doa_angle: Optional[float]  # Ángulo DOA (None si no se pudo calcular)
+    doa_psr_db: Optional[float]  # Calidad del DOA (Peak-to-Sidelobe Ratio)
+    first_seen: float  # Timestamp de primera detección
+    last_seen: float  # Timestamp de última detección
+    detection_count: int  # Número de veces detectado
+    consecutive_detections: int  # Detecciones consecutivas actuales
+    status: str  # "tentative", "confirmed", "lost"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "drone_id": self.drone_id,
+            "frequency_hz": self.frequency_hz,
+            "drone_class": self.drone_class,
+            "confidence": self.confidence,
+            "doa_angle": self.doa_angle,
+            "doa_psr_db": self.doa_psr_db,
+            "first_seen": self.first_seen,
+            "last_seen": self.last_seen,
+            "detection_count": self.detection_count,
+            "consecutive_detections": self.consecutive_detections,
+            "status": self.status,
+            "age_sec": time.time() - self.first_seen,
+            "time_since_last_sec": time.time() - self.last_seen,
+        }
+
+
+class MultiDroneTracker:
+    """
+    Gestiona múltiples detecciones de drones en diferentes frecuencias.
+
+    Estrategia HÍBRIDA (Barrido + Verificación):
+    ============================================
+    1. BARRIDO: Descubre nuevos drones con predicción completa
+    2. VERIFICACIÓN: Solo DOA en frecuencias conocidas (rápido)
+
+    Ciclo de vida de un dron:
+    - "tentative" → Primera(s) detección(es)
+    - "confirmed" → Suficientes detecciones consecutivas
+    - "lost" → Demasiados fallos de verificación o timeout
+    """
+
+    def __init__(self, timeout_sec: float = DRONE_TIMEOUT_SEC,
+                 min_confirmations: int = MIN_DETECTIONS_CONFIRM,
+                 max_verification_failures: int = 3):
+        self.drones: Dict[float, DroneDetection] = {}  # freq_hz -> DroneDetection
+        self.timeout_sec = timeout_sec
+        self.min_confirmations = min_confirmations
+        self.max_verification_failures = max_verification_failures
+        self.drone_counter = 0  # Para generar IDs únicos
+        self.verification_failures: Dict[float, int] = {}  # freq -> contador de fallos
+        self.lock = threading.Lock()
+
+    def _generate_drone_id(self) -> str:
+        self.drone_counter += 1
+        return f"DRONE_{self.drone_counter:04d}"
+
+    def get_known_frequencies(self) -> List[float]:
+        """
+        Retorna lista de frecuencias donde hay drones conocidos.
+        Usado para la fase de VERIFICACIÓN.
+        """
+        with self.lock:
+            return list(self.drones.keys())
+
+    def get_drone_at_frequency(self, frequency_hz: float) -> Optional[DroneDetection]:
+        """Retorna el dron en una frecuencia específica (si existe)."""
+        with self.lock:
+            existing_freq = self._find_nearby_frequency(frequency_hz)
+            if existing_freq is not None:
+                return self.drones[existing_freq]
+            return None
+
+    def update_doa_verification(self, frequency_hz: float, doa_angle: float,
+                                doa_psr_db: float) -> Optional[DroneDetection]:
+        """
+        Actualiza SOLO el DOA de un dron existente (verificación rápida).
+        No requiere predicción completa, solo confirma que el dron sigue ahí.
+
+        Returns:
+            DroneDetection actualizada o None si no existe
+        """
+        now = time.time()
+
+        with self.lock:
+            existing_freq = self._find_nearby_frequency(frequency_hz)
+
+            if existing_freq is None:
+                return None
+
+            drone = self.drones[existing_freq]
+            drone.last_seen = now
+            drone.doa_angle = doa_angle
+            drone.doa_psr_db = doa_psr_db
+            drone.detection_count += 1
+            drone.consecutive_detections += 1
+
+            # Resetear contador de fallos de verificación
+            self.verification_failures[existing_freq] = 0
+
+            # Promover a "confirmed" si tiene suficientes detecciones
+            if (drone.status == "tentative" and
+                    drone.consecutive_detections >= self.min_confirmations):
+                drone.status = "confirmed"
+                print(f"[MultiDrone] ✅ Dron CONFIRMADO: {drone.drone_id} en {frequency_hz / 1e6:.1f} MHz")
+
+            return drone
+
+    def mark_verification_failed(self, frequency_hz: float) -> bool:
+        """
+        Marca que la verificación DOA falló para esta frecuencia.
+
+        Returns:
+            True si el dron fue eliminado por demasiados fallos
+        """
+        with self.lock:
+            existing_freq = self._find_nearby_frequency(frequency_hz)
+
+            if existing_freq is None:
+                return False
+
+            # Incrementar contador de fallos
+            self.verification_failures[existing_freq] = \
+                self.verification_failures.get(existing_freq, 0) + 1
+
+            failures = self.verification_failures[existing_freq]
+            drone = self.drones[existing_freq]
+            drone.consecutive_detections = 0
+
+            print(f"[MultiDrone] ⚠️  Verificación fallida para {drone.drone_id} "
+                  f"({failures}/{self.max_verification_failures})")
+
+            # Eliminar si hay demasiados fallos
+            if failures >= self.max_verification_failures:
+                drone.status = "lost"
+                print(f"[MultiDrone] ❌ Dron PERDIDO (verificación): {drone.drone_id} "
+                      f"en {existing_freq / 1e6:.1f} MHz")
+                del self.drones[existing_freq]
+                del self.verification_failures[existing_freq]
+                return True
+
+            return False
+
+    def update_detection(self, frequency_hz: float, drone_class: str,
+                         confidence: float, doa_angle: Optional[float] = None,
+                         doa_psr_db: Optional[float] = None) -> DroneDetection:
+        """
+        Actualiza o crea una detección de dron en la frecuencia dada.
+        Usado en la fase de BARRIDO (predicción completa).
+
+        Returns:
+            DroneDetection actualizada
+        """
+        now = time.time()
+
+        with self.lock:
+            # Buscar si ya existe un dron en esta frecuencia (con tolerancia)
+            existing_freq = self._find_nearby_frequency(frequency_hz)
+
+            if existing_freq is not None:
+                # Actualizar dron existente
+                drone = self.drones[existing_freq]
+                drone.last_seen = now
+                drone.detection_count += 1
+                drone.consecutive_detections += 1
+                drone.drone_class = drone_class
+                drone.confidence = confidence
+
+                # Resetear contador de fallos
+                self.verification_failures[existing_freq] = 0
+
+                # Actualizar DOA si se proporcionó uno válido
+                if doa_angle is not None:
+                    drone.doa_angle = doa_angle
+                    drone.doa_psr_db = doa_psr_db
+
+                # Promover a "confirmed" si tiene suficientes detecciones
+                if (drone.status == "tentative" and
+                        drone.consecutive_detections >= self.min_confirmations):
+                    drone.status = "confirmed"
+                    print(f"[MultiDrone] ✅ Dron CONFIRMADO: {drone.drone_id} en {frequency_hz / 1e6:.1f} MHz")
+
+                return drone
+            else:
+                # Crear nuevo dron
+                drone_id = self._generate_drone_id()
+                drone = DroneDetection(
+                    drone_id=drone_id,
+                    frequency_hz=frequency_hz,
+                    drone_class=drone_class,
+                    confidence=confidence,
+                    doa_angle=doa_angle,
+                    doa_psr_db=doa_psr_db,
+                    first_seen=now,
+                    last_seen=now,
+                    detection_count=1,
+                    consecutive_detections=1,
+                    status="tentative"
+                )
+                self.drones[frequency_hz] = drone
+                self.verification_failures[frequency_hz] = 0
+                print(
+                    f"[MultiDrone] 🆕 Nuevo dron detectado: {drone_id} en {frequency_hz / 1e6:.1f} MHz ({drone_class})")
+                return drone
+
+    def _find_nearby_frequency(self, frequency_hz: float, tolerance_hz: float = 5e6) -> Optional[float]:
+        """Busca una frecuencia cercana en el tracker (dentro de la tolerancia)."""
+        for freq in self.drones.keys():
+            if abs(freq - frequency_hz) <= tolerance_hz:
+                return freq
+        return None
+
+    def mark_no_detection(self, frequency_hz: float):
+        """
+        Marca que NO se detectó dron en esta frecuencia durante barrido.
+        """
+        with self.lock:
+            existing_freq = self._find_nearby_frequency(frequency_hz)
+            if existing_freq is not None:
+                self.drones[existing_freq].consecutive_detections = 0
+
+    def cleanup_lost_drones(self) -> List[DroneDetection]:
+        """
+        Elimina drones que no se han visto en timeout_sec segundos.
+
+        Returns:
+            Lista de drones eliminados
+        """
+        now = time.time()
+        lost = []
+
+        with self.lock:
+            freqs_to_remove = []
+            for freq, drone in self.drones.items():
+                if now - drone.last_seen > self.timeout_sec:
+                    drone.status = "lost"
+                    lost.append(drone)
+                    freqs_to_remove.append(freq)
+                    print(f"[MultiDrone] ❌ Dron PERDIDO (timeout): {drone.drone_id} en {freq / 1e6:.1f} MHz")
+
+            for freq in freqs_to_remove:
+                del self.drones[freq]
+                if freq in self.verification_failures:
+                    del self.verification_failures[freq]
+
+        return lost
+
+    def get_active_drones(self) -> List[DroneDetection]:
+        """Retorna lista de drones activos (tentative + confirmed)."""
+        with self.lock:
+            return list(self.drones.values())
+
+    def get_confirmed_drones(self) -> List[DroneDetection]:
+        """Retorna solo drones confirmados."""
+        with self.lock:
+            return [d for d in self.drones.values() if d.status == "confirmed"]
+
+    def has_known_drones(self) -> bool:
+        """Retorna True si hay drones conocidos para verificar."""
+        with self.lock:
+            return len(self.drones) > 0
+
+    def get_summary(self) -> Dict[str, Any]:
+        """Retorna resumen del estado actual."""
+        with self.lock:
+            active = list(self.drones.values())
+            return {
+                "total_active": len(active),
+                "confirmed": len([d for d in active if d.status == "confirmed"]),
+                "tentative": len([d for d in active if d.status == "tentative"]),
+                "drones": [d.to_dict() for d in active],
+                "timestamp": time.time(),
+            }
 
 
 # ================================================================
@@ -201,7 +519,7 @@ except Exception as e:
 
 
 # ================================================================
-# Helpers PSD / SPEC / PRED / DOA
+# Helpers PSD / SPEC / PRED / DOA / GPS
 # ================================================================
 def _compute_psd_db(x: np.ndarray, nfft: int = 4096) -> np.ndarray:
     if x.ndim != 1:
@@ -215,11 +533,11 @@ def _compute_psd_db(x: np.ndarray, nfft: int = 4096) -> np.ndarray:
 
 
 def publish_psd(
-    x_complex: np.ndarray,
-    center_hz: float,
-    sample_rate: float,
-    nfft: int = 4096,
-    drone_id: Optional[str] = None,
+        x_complex: np.ndarray,
+        center_hz: float,
+        sample_rate: float,
+        nfft: int = 4096,
+        drone_id: Optional[str] = None,
 ) -> None:
     psd_db = _compute_psd_db(x_complex.astype(np.complex64), nfft=nfft)
     frame = {
@@ -237,12 +555,64 @@ def publish_psd(
         print("[pipeline] ingest error:", e)
 
 
-def publish_doa(angle_deg: float) -> None:
-    body = {"angle_deg": float(angle_deg)}
+def publish_doa(
+    angle_deg: float,
+    *,
+    blade_serial: str,
+    center_freq_hz: Optional[float] = None,
+    psr_db: Optional[float] = None,
+) -> None:
+    body: Dict[str, Any] = {
+        "angle_deg": float(angle_deg),
+        "blade_serial": str(blade_serial),
+        "capture_time_sec": time.time(),
+    }
+    if center_freq_hz is not None:
+        body["center_freq_hz"] = float(center_freq_hz)
+    if psr_db is not None:
+        body["psr_db"] = float(psr_db)
+
     try:
         requests.post(DOA_INGEST_URL, json=body, timeout=0.5)
     except Exception as e:
         print("[pipeline] publish_doa HTTP error:", e)
+
+
+def publish_multi_drone(tracker: MultiDroneTracker, blade_name: str = "unknown") -> None:
+    """
+    Publica el estado completo de todos los drones detectados.
+    """
+    summary = tracker.get_summary()
+    summary["blade_id"] = blade_name
+    try:
+        requests.post(MULTI_DRONE_INGEST_URL, json=summary, timeout=0.7)
+    except Exception as e:
+        print("[pipeline] publish_multi_drone HTTP error:", e)
+
+
+def publish_drone_detection(drone: DroneDetection, blade_name: str = "unknown") -> None:
+    """
+    Publica una detección individual de dron (para actualizaciones en tiempo real).
+    """
+    body = {
+        "blade_id": blade_name,
+        "drone": drone.to_dict(),
+        "timestamp": time.time(),
+    }
+    try:
+        # Usar el mismo endpoint de predicción pero con info extendida
+        requests.post(PRED_INGEST_URL, json={
+            "label": drone.drone_class,
+            "confidence": drone.confidence,
+            "center_freq": drone.frequency_hz,
+            "mode": "continuous_scan",
+            "drone_id": drone.drone_id,
+            "doa_angle": drone.doa_angle,
+            "status": drone.status,
+            "timestamp": time.time(),
+        }, timeout=0.5)
+    except Exception as e:
+        print("[pipeline] publish_drone_detection HTTP error:", e)
 
 
 def build_spectrogram_frame(spectrogram: torch.Tensor, class_name: str) -> dict:
@@ -263,6 +633,284 @@ def build_spectrogram_frame(spectrogram: torch.Tensor, class_name: str) -> dict:
     }
 
 
+def get_connected_blades() -> List[Dict[str, Any]]:
+    devinfos = _bladerf.get_device_list()
+    devices: List[Dict[str, Any]] = []
+    for info in devinfos:
+        devices.append({
+            "serial": _devinfo_serial_str(info),
+            "backend": getattr(info, "backend", None),
+            "usb_bus": getattr(info, "usb_bus", None),
+            "usb_addr": getattr(info, "usb_addr", None),
+        })
+    return devices
+
+def count_connected_blades() -> int:
+    return len(_bladerf.get_device_list())
+
+def count_unique_blades_by_serial() -> int:
+    devinfos = _bladerf.get_device_list()
+    serials = [_devinfo_serial_str(i) for i in devinfos]
+    return len(set(serials))
+
+
+def _normalize_bearing_deg(x: float) -> float:
+    x = float(x) % 360.0
+    return x + 360.0 if x < 0 else x
+
+
+def _destination(lon_deg: float, lat_deg: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
+    """
+    Destino geodésico simple (esfera). Retorna (lon, lat) en grados.
+    """
+    R = 6371000.0
+    brng = math.radians(_normalize_bearing_deg(bearing_deg))
+    lat1 = math.radians(lat_deg)
+    lon1 = math.radians(lon_deg)
+
+    dr = distance_m / R
+    lat2 = math.asin(math.sin(lat1) * math.cos(dr) + math.cos(lat1) * math.sin(dr) * math.cos(brng))
+    lon2 = lon1 + math.atan2(
+        math.sin(brng) * math.sin(dr) * math.cos(lat1),
+        math.cos(dr) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    return (math.degrees(lon2), math.degrees(lat2))
+
+
+def _fetch_all_nodes_positions_http(n_samples: int, timeout_s: float = 1.5) -> dict:
+    """
+    Llama al endpoint que trae todas las posiciones de nodos GPS.
+    Espera un JSON tipo:
+      { count: N, devices: [ {port, ok, data:{avg:{lat,lon}}, n_samples}, ... ] }
+    """
+    url = f"{NODE_GPS_ALL_CAPTURE_URL}/{int(n_samples)}"
+    r = requests.get(url, timeout=timeout_s)
+    r.raise_for_status()
+    return r.json()
+
+
+def _parse_nodes_payload(payload: dict) -> dict:
+    """
+    Retorna dict: port -> {"lat": float, "lon": float}
+    Solo para devices ok con lat/lon.
+    """
+    out = {}
+    for dev in (payload or {}).get("devices", []) or []:
+        port = dev.get("port") or "UNKNOWN"
+        ok = bool(dev.get("ok"))
+        data = dev.get("data") or {}
+        avg = data.get("avg") or {}
+        lat = avg.get("lat")
+        lon = avg.get("lon")
+        if ok and lat is not None and lon is not None:
+            out[str(port)] = {"lat": float(lat), "lon": float(lon)}
+    return out
+
+
+def _mean_latlon(pos_by_port: dict) -> tuple[float, float] | tuple[None, None]:
+    if not pos_by_port:
+        return None, None
+    lats = [v["lat"] for v in pos_by_port.values()]
+    lons = [v["lon"] for v in pos_by_port.values()]
+    return sum(lats) / len(lats), sum(lons) / len(lons)
+
+
+def _compute_left_right_from_avg(avg_lat: float, avg_lon: float, heading_deg: float, offset_m: float) -> dict:
+    """
+    Genera posiciones sintéticas:
+      left  = avg desplazado heading-90
+      right = avg desplazado heading+90
+    Retorna dict con llaves NODE_LEFT/NODE_RIGHT.
+    """
+    axis = _normalize_bearing_deg(heading_deg)
+    left_lon, left_lat = _destination(avg_lon, avg_lat, axis - 90.0, offset_m)
+    right_lon, right_lat = _destination(avg_lon, avg_lat, axis + 90.0, offset_m)
+    return {
+        "NODE_LEFT": {"lat": float(left_lat), "lon": float(left_lon)},
+        "NODE_RIGHT": {"lat": float(right_lat), "lon": float(right_lon)},
+    }
+
+
+def _pick_node_position_for_this_blade(
+    blade_name: str,
+    pos_by_port: dict,
+    *,
+    heading_deg: float = 0.0,
+    offset_m: float = NODE_OFFSET_M,
+    node_port: str | None = None,
+    node_side: str | None = None,
+) -> tuple[float | None, float | None, str]:
+    """
+    Decide la posición (lat, lon) de ESTE blade.
+
+    Prioridad:
+      1) node_port explícito (PIPELINE_NODE_PORT o param)
+      2) node_side left/right (PIPELINE_NODE_SIDE o param) buscando NODE_LEFT/NODE_RIGHT
+      3) heurística por nombre del blade (contiene "left"/"right")
+      4) si no hay 2 nodos claros: promedio + sintetiza LEFT/RIGHT a ±offset_m con heading
+      5) fallback: si hay al menos 1 nodo, usar el primero
+    """
+    node_port = node_port or PIPELINE_NODE_PORT
+    node_side = (node_side or PIPELINE_NODE_SIDE or "").strip().lower()
+
+    # 1) Port explícito
+    if node_port and node_port in pos_by_port:
+        p = pos_by_port[node_port]
+        return p["lat"], p["lon"], f"port:{node_port}"
+
+    # 2) Side explícito
+    if node_side in ("left", "right"):
+        key = "NODE_LEFT" if node_side == "left" else "NODE_RIGHT"
+        if key in pos_by_port:
+            p = pos_by_port[key]
+            return p["lat"], p["lon"], f"side:{node_side} (real:{key})"
+
+    # 3) Heurística por nombre
+    bn = (blade_name or "").lower()
+    if "left" in bn and "NODE_LEFT" in pos_by_port:
+        p = pos_by_port["NODE_LEFT"]
+        return p["lat"], p["lon"], "name:left (real:NODE_LEFT)"
+    if "right" in bn and "NODE_RIGHT" in pos_by_port:
+        p = pos_by_port["NODE_RIGHT"]
+        return p["lat"], p["lon"], "name:right (real:NODE_RIGHT)"
+
+    # 4) Sintetizar LEFT/RIGHT desde promedio si no están
+    avg_lat, avg_lon = _mean_latlon(pos_by_port)
+    if avg_lat is not None and avg_lon is not None:
+        synth = _compute_left_right_from_avg(avg_lat, avg_lon, heading_deg, offset_m)
+        if node_side in ("left", "right"):
+            key = "NODE_LEFT" if node_side == "left" else "NODE_RIGHT"
+            p = synth[key]
+            return p["lat"], p["lon"], f"side:{node_side} (synthetic)"
+        # Si no hay side, pero el nombre sugiere:
+        if "left" in bn:
+            p = synth["NODE_LEFT"]
+            return p["lat"], p["lon"], "name:left (synthetic)"
+        if "right" in bn:
+            p = synth["NODE_RIGHT"]
+            return p["lat"], p["lon"], "name:right (synthetic)"
+        # Si nada: devolver el promedio
+        return avg_lat, avg_lon, "avg(all_nodes)"
+
+    # 5) fallback: primer nodo disponible
+    if pos_by_port:
+        first_port = sorted(pos_by_port.keys())[0]
+        p = pos_by_port[first_port]
+        return p["lat"], p["lon"], f"fallback:first_port:{first_port}"
+
+    return None, None, "no_gps_available"
+
+
+def _safe_call_triangulation(fn, **kwargs):
+    """
+    Llama estimate_emitter_latlon_enu_ls filtrando kwargs por signature (para no romper).
+    """
+    try:
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(**filtered)
+    except Exception as e:
+        print("[Triangulation] error:", e)
+        return None
+
+# ============================
+# TRIANGULATION SHARED BUFFER (entre hilos de blades)
+# ============================
+TRI_LOCK = threading.Lock()
+
+TRI_TTL_S = float(os.getenv("TRI_TTL_S", "1.0"))            # ventana de tiempo para considerar DOAs "simultáneos"
+TRI_MIN_NODES = int(os.getenv("TRI_MIN_NODES", "2"))        # mínimo de nodos para triangular
+TRI_FREQ_TOL_HZ = float(os.getenv("TRI_FREQ_TOL_HZ", "5e6"))# tolerancia por frecuencia (ej 5 MHz)
+
+# bucket_freq -> serial -> obs
+TRI_OBS: Dict[float, Dict[str, Dict[str, float]]] = {}
+
+def _tri_bucket(freq_hz: float) -> float:
+    return float(round(freq_hz / TRI_FREQ_TOL_HZ) * TRI_FREQ_TOL_HZ)
+
+def tri_update_and_solve(
+    *,
+    freq_hz: float,
+    blade_serial: str,
+    doa_local_deg: float,
+    node_lat: Optional[float],
+    node_lon: Optional[float],
+    heading_deg: float = 0.0,
+):
+    """
+    1) Guarda (DOA, lat, lon, heading) del blade actual en un buffer compartido.
+    2) Si hay >= TRI_MIN_NODES observaciones recientes para la misma freq (bucket),
+       llama estimate_emitter_latlon_enu_ls y retorna TriangulationResult.
+    """
+    if node_lat is None or node_lon is None:
+        return None
+
+    now = time.time()
+    key = _tri_bucket(freq_hz)
+
+    with TRI_LOCK:
+        bucket = TRI_OBS.setdefault(key, {})
+        bucket[str(blade_serial)] = {
+            "ts": float(now),
+            "doa": float(doa_local_deg),
+            "lat": float(node_lat),
+            "lon": float(node_lon),
+            "heading": float(heading_deg),
+        }
+
+        # limpiar stale
+        for s in list(bucket.keys()):
+            if now - bucket[s]["ts"] > TRI_TTL_S:
+                bucket.pop(s, None)
+
+        if len(bucket) < TRI_MIN_NODES:
+            return None
+
+        obs = list(bucket.values())
+
+    # IMPORTANTE: este doa_local_deg debe ser consistente con tu heading (0=N, 90=E) según tu doc
+    return _safe_call_triangulation(
+        estimate_emitter_latlon_enu_ls,
+        n_active=len(obs),
+        doa_local_deg=[o["doa"] for o in obs],
+        node_lat_deg=[o["lat"] for o in obs],
+        node_lon_deg=[o["lon"] for o in obs],
+        heading_deg=[o["heading"] for o in obs],
+        earth_radius_m=6_371_000.0,
+    )
+
+# ============================
+# ORIENTACIÓN (solo una vez, cacheada por proceso)
+# ============================
+_ORI_LOCK = threading.Lock()
+_ORI_HEADING_DEG: Optional[float] = None
+
+def get_fixed_heading_deg() -> float:
+    """
+    Lee el heading del BNO055 UNA sola vez (por proceso) y lo reutiliza.
+    """
+    global _ORI_HEADING_DEG
+
+    with _ORI_LOCK:
+        if _ORI_HEADING_DEG is not None:
+            return _ORI_HEADING_DEG
+
+        try:
+            samples = int(os.getenv("BNO055_SAMPLES", "5"))
+            h = get_orientation(samples=samples)  # <-- tu función retorna float
+            if h is None or (isinstance(h, float) and math.isnan(h)):
+                raise ValueError("heading inválido (NaN/None)")
+
+            _ORI_HEADING_DEG = _normalize_bearing_deg(float(h))
+            print(f"[Orientation] ✅ Heading fijo: {_ORI_HEADING_DEG:.2f}° (samples={samples})")
+        except Exception as e:
+            _ORI_HEADING_DEG = 0.0
+            print(f"[Orientation] ⚠️ No se pudo leer BNO055, usando 0.0° | error: {e}")
+
+        return _ORI_HEADING_DEG
+
+
 # =============================================================================
 # Utilidades generales
 # =============================================================================
@@ -270,6 +918,7 @@ def build_spectrogram_frame(spectrogram: torch.Tensor, class_name: str) -> dict:
 def wavelength(fc_hz: float) -> float:
     """Longitud de onda λ = c / f."""
     return C0 / fc_hz
+
 
 def preprocess_iq(X: np.ndarray,
                   *,
@@ -314,6 +963,7 @@ def steering_vector(theta_deg: float, M: int, d_lambda: float) -> np.ndarray:
     m = np.arange(M)[:, None]  # (M,1)
     return np.exp(-1j * 2.0 * np.pi * d_lambda * m * np.sin(np.deg2rad(theta_deg)))
 
+
 def mvdr_block(X_block: np.ndarray,
                angles: np.ndarray,
                d_lambda: float,
@@ -345,6 +995,7 @@ def mvdr_block(X_block: np.ndarray,
         P[i] = 1.0 / max(np.real(denom), 1e-12)
 
     return P
+
 
 def estimate_doa_mvdr(X_full: np.ndarray,
                       fc_hz: float,
@@ -609,17 +1260,17 @@ def smooth_predictions(result, results_list, window_size=5, adaptive=True, max_h
 
 
 def visualize_spectrogram(
-    spectrogram: torch.Tensor,
-    class_name: str,
-    blade_id: str,
-    n_fft: int = 512,
-    win_length: int = 512,
-    hop_length: int = 5860,
-    sample_freq: float = 40e6,
-    pmin: Optional[float] = None,
-    pmax: Optional[float] = None,
-    show_stats: bool = True,
-    figsize: tuple = (16, 4),
+        spectrogram: torch.Tensor,
+        class_name: str,
+        blade_id: str,
+        n_fft: int = 512,
+        win_length: int = 512,
+        hop_length: int = 5860,
+        sample_freq: float = 40e6,
+        pmin: Optional[float] = None,
+        pmax: Optional[float] = None,
+        show_stats: bool = True,
+        figsize: tuple = (16, 4),
 ) -> None:
     if blade_id is None:
         blade_id = os.getenv("PIPELINE_DEVICE_NAME", "default_blade")
@@ -695,12 +1346,12 @@ def visualize_spectrogram(
 
 
 def publish_pred(
-    label_name: str,
-    confidence: Optional[float] = None,
-    binary_info: Optional[dict] = None,
-    multiclass_info: Optional[dict] = None,
-    center_freq: Optional[float] = None,
-    mode: Optional[str] = None,
+        label_name: str,
+        confidence: Optional[float] = None,
+        binary_info: Optional[dict] = None,
+        multiclass_info: Optional[dict] = None,
+        center_freq: Optional[float] = None,
+        mode: Optional[str] = None,
 ) -> None:
     """
     Publica la predicción actual hacia el endpoint HTTP del backend.
@@ -805,7 +1456,7 @@ def _open_bladerf_from_env(dev_id: Optional[str]):
             try:
                 dev = _bladerf.BladeRF(devinfo=info)
                 print(f"[SDR] Dispositivo abierto: {dev}")
-                return dev
+                return dev, serial_str
             except Exception as e:
                 print(f"[SDR] Error abriendo dispositivo con ese serial: {e}")
                 raise RuntimeError("Failed to open bladeRF") from e
@@ -833,6 +1484,7 @@ def configure_common_channels(sdr: _bladerf.BladeRF):
 
     return rx0, rx1
 
+
 def capture_single_channel(sdr: _bladerf.BladeRF, num_samples: int) -> np.ndarray:
     """Captura IQ de un solo canal en modo RX_X1."""
     bytes_per_sample = 4  # I int16 + Q int16
@@ -859,6 +1511,7 @@ def capture_single_channel(sdr: _bladerf.BladeRF, num_samples: int) -> np.ndarra
         num_samples_read += num
 
     return x
+
 
 def capture_dual_channel(sdr: _bladerf.BladeRF, num_samples: int) -> tuple[np.ndarray, np.ndarray]:
     """Captura IQ de dos canales en modo RX_X2: I0,Q0,I1,Q1."""
@@ -899,72 +1552,189 @@ def run_pipeline(
     dev_id: Optional[str] = None,
     device_name: Optional[str] = None,
     stop_event: Optional[threading.Event] = None,
-
+    node_port: Optional[str] = None,
+    node_side: Optional[str] = None,
+    gps_port: Optional[str] = None,     # ✅ NUEVO
+    gps_baud: int = 4800,               # ✅ NUEVO
 ) -> None:
     """
     Bucle principal del pipeline. Bloqueante. Pensado para correrse en un hilo.
 
-    Nuevo comportamiento:
-    - Modo SCAN: el bladeRF barre un conjunto de frecuencias centrales
-      (definidas por SDR_CONFIG[min_freq, max_freq, step_freq]).
-    - Si en alguna frecuencia se detecta un dron (clase != "Noise"/"Jammer"),
-      el pipeline entra en modo TRACK y se queda "anclado" en esa frecuencia.
-    - Si en modo TRACK se deja de ver el dron durante varios ciclos seguidos,
-      se vuelve a modo SCAN y se reanuda el barrido hasta encontrarlo de nuevo.
+    COMPORTAMIENTO HÍBRIDO (Barrido + Verificación DOA):
+    ====================================================
 
+    Cada iteración tiene DOS FASES:
+
+    FASE 1 - VERIFICACIÓN (rápida):
+    --------------------------------
+    Para cada frecuencia donde hay un dron conocido:
+    - Sintoniza la frecuencia
+    - Ejecuta SOLO DOA (sin predicción completa)
+    - Si DOA válido: actualiza ángulo y confirma que sigue ahí
+    - Si DOA inválido: incrementa contador de fallos
+
+    FASE 2 - BARRIDO (descubrimiento):
+    -----------------------------------
+    - Avanza a la siguiente frecuencia del barrido secuencial
+    - Captura completa + Espectrograma + Predicción
+    - Si detecta dron nuevo: lo agrega al tracker + DOA
+    - Continúa con el ciclo
+
+    Ventajas:
+    - Verificación rápida de drones conocidos (solo DOA ~100ms)
+    - Descubrimiento continuo de nuevos drones
+    - Actualización frecuente de ángulos DOA
+    - No se "ciega" en una sola frecuencia
     """
 
-    NUM_READS = 5  # nº de lecturas MVDR por ciclo
-    PSR_MIN_DB = 8.0  # umbral de calidad (peak / median)
-    WINDOW_WIDTH = 10.0
+    # Parámetros DOA
+    NUM_READS_VERIFY = 2  # Lecturas MVDR para verificación (rápido)
+    NUM_READS_DISCOVER = 3  # Lecturas MVDR para descubrimiento
+    PSR_MIN_DB = 8.0  # Umbral de calidad DOA
+    WINDOW_WIDTH = 10.0  # Grados para clustering de ángulos
+    MAX_VERIFICATION_FAILURES = int(os.getenv("MAX_VERIFICATION_FAILURES", "3"))
+
     effective_dev_id = dev_id or os.getenv("BLADERF_DEVICE")
     blade_name = device_name or os.getenv("PIPELINE_DEVICE_NAME", effective_dev_id or "default_blade")
 
+    fixed_heading_deg = get_fixed_heading_deg()
+    # ✅ Cargar GPS al inicio (o fallback Medellín)
+
+
+    gps_cache = {
+        "last_fetch": 0.0,
+        "pos_by_port": {},  # port -> {lat, lon}
+        "last_debug": "init",
+        "node_lat": None,
+        "node_lon": None,
+        "node_src": "init",
+    }
+
+    def refresh_gps_cache(force: bool = False):
+        now = time.time()
+        if (not force) and (now - gps_cache["last_fetch"] < NODE_GPS_REFRESH_S):
+            return
+
+        heading_deg = fixed_heading_deg
+
+        try:
+            payload = _fetch_all_nodes_positions_http(NODE_GPS_SAMPLES, timeout_s=1.5)
+            pos_by_port = _parse_nodes_payload(payload)
+
+            # ✅ Si no hay nodos reales, usamos Medellín y sintetizamos LEFT/RIGHT
+            if not pos_by_port:
+                pos_by_port = _compute_left_right_from_avg(
+                    FALLBACK_LAT,
+                    FALLBACK_LON,
+                    heading_deg,
+                    NODE_OFFSET_M,
+                )
+                src_note = f"fallback:{FALLBACK_CITY} (synthetic LEFT/RIGHT)"
+            else:
+                src_note = "gps:nodes_http"
+
+            node_lat, node_lon, src = _pick_node_position_for_this_blade(
+                blade_name=blade_name,
+                pos_by_port=pos_by_port,
+                heading_deg=heading_deg,
+                offset_m=NODE_OFFSET_M,
+                node_port=node_port,
+                node_side=node_side,
+            )
+
+            # ✅ Si por alguna razón sigue None, forzamos fallback Medellín promedio
+            if node_lat is None or node_lon is None:
+                synth = _compute_left_right_from_avg(FALLBACK_LAT, FALLBACK_LON, heading_deg, NODE_OFFSET_M)
+                node_lat, node_lon, src2 = _pick_node_position_for_this_blade(
+                    blade_name=blade_name,
+                    pos_by_port=synth,
+                    heading_deg=heading_deg,
+                    offset_m=NODE_OFFSET_M,
+                    node_port=node_port,
+                    node_side=node_side,
+                )
+                src = f"{src2} | fallback:{FALLBACK_CITY}"
+                pos_by_port = synth
+                src_note = f"fallback:{FALLBACK_CITY} (forced)"
+
+            gps_cache["last_fetch"] = now
+            gps_cache["pos_by_port"] = pos_by_port
+            gps_cache["node_lat"] = node_lat
+            gps_cache["node_lon"] = node_lon
+            gps_cache["node_src"] = f"{src_note} | {src}"
+            gps_cache["last_debug"] = "ok"
+
+        except Exception as e:
+            # ✅ Si el HTTP falla, igual caemos a Medellín y seguimos vivos
+            pos_by_port = _compute_left_right_from_avg(FALLBACK_LAT, FALLBACK_LON, heading_deg, NODE_OFFSET_M)
+            node_lat, node_lon, src = _pick_node_position_for_this_blade(
+                blade_name=blade_name,
+                pos_by_port=pos_by_port,
+                heading_deg=heading_deg,
+                offset_m=NODE_OFFSET_M,
+                node_port=node_port,
+                node_side=node_side,
+            )
+
+            gps_cache["last_fetch"] = now
+            gps_cache["pos_by_port"] = pos_by_port
+            gps_cache["node_lat"] = node_lat
+            gps_cache["node_lon"] = node_lon
+            gps_cache["node_src"] = f"http_error:{e} | fallback:{FALLBACK_CITY} | {src}"
+            gps_cache["last_debug"] = f"http_error:{e}"
+
+    refresh_gps_cache(force=True)
+
+
     print(f"[Pipeline] run_pipeline(dev_id={effective_dev_id}, name={blade_name})")
+    print(f"[Pipeline] MODO: HÍBRIDO (Barrido + Verificación DOA)")
 
+    # Parámetros de configuración
+    SCAN_WINDOW = int(os.getenv("SCAN_WINDOW_SIZE", "1"))
+    CLEANUP_INTERVAL = int(os.getenv("DRONE_CLEANUP_INTERVAL", "10"))
 
-
-    # Parámetros del comportamiento de escaneo / seguimiento
-    LOCK_CONSECUTIVE = int(os.getenv("DRONE_LOCK_CONSECUTIVE", "2"))   # nº de detecciones seguidas para fijar frecuencia
-    LOST_CONSECUTIVE = int(os.getenv("DRONE_LOST_CONSECUTIVE", "4"))   # nº de pérdidas seguidas para soltar frecuencia
-    SCAN_WINDOW = int(os.getenv("SCAN_WINDOW_SIZE", "1"))              # ventana de suavizado en modo SCAN
-    TRACK_WINDOW = int(os.getenv("TRACK_WINDOW_SIZE", "5"))            # ventana de suavizado en modo TRACK
-
-    # Definimos lista discreta de frecuencias de escaneo a partir de la config
+    # Frecuencias de escaneo
     min_freq = int(SDR_CONFIG["min_freq"])
     max_freq = int(SDR_CONFIG["max_freq"])
     step_freq = int(SDR_CONFIG["step_freq"])
 
+
     if step_freq <= 0:
-        raise RuntimeError("SDR_CONFIG['step_freq'] debe ser > 0 para el modo SCAN/TRACK")
+        raise RuntimeError("SDR_CONFIG['step_freq'] debe ser > 0")
 
     scan_freqs = list(range(min_freq, max_freq + 1, step_freq))
     if not scan_freqs:
         scan_freqs = [int(SDR_CONFIG["center_freq"])]
 
-    print(f"[Pipeline] Frecuencias de escaneo: {', '.join(str(f) for f in scan_freqs)}")
+    print(f"[Pipeline] Frecuencias de escaneo: {[f'{f / 1e6:.0f} MHz' for f in scan_freqs]}")
+    print(f"[Pipeline] Total de frecuencias: {len(scan_freqs)}")
+    print(f"[Pipeline] Timeout de drones: {DRONE_TIMEOUT_SEC} seg")
+    print(f"[Pipeline] Max fallos verificación: {MAX_VERIFICATION_FAILURES}")
 
-    # Estado del modo de operación
-    mode = "scan"           # 'scan' o 'track'
-    locked_freq = None      # frecuencia central bloqueada en modo TRACK
-    last_detection_freq = None
+    # ========================================
+    # Inicializar Multi-Drone Tracker
+    # ========================================
+    drone_tracker = MultiDroneTracker(
+        timeout_sec=DRONE_TIMEOUT_SEC,
+        min_confirmations=MIN_DETECTIONS_CONFIRM,
+        max_verification_failures=MAX_VERIFICATION_FAILURES
+    )
+
+    # Estado del barrido
     scan_index = 0
-    consecutive_hits = 0
-    consecutive_misses = 0
-
+    iteration_count = 0
 
     try:
-        sdr = _open_bladerf_from_env(effective_dev_id)
+        sdr, blade_serial = _open_bladerf_from_env(effective_dev_id)
     except Exception as e:
         print(f"[Pipeline] No se pudo abrir bladeRF ({blade_name}): {e}")
         return
 
-    # Configurar el bladeRF para usar referencia externa de 10 MHz
+    # Configurar PLL
     sdr.set_pll_refclk(int(10e6))
     sdr.set_pll_enable(True)
-    # (Opcional pero recomendado) Esperar a que el PLL bloquee
     for _ in range(50):
-        if sdr.get_pll_lock_state():  # True cuando el PLL está bloqueado
+        if sdr.get_pll_lock_state():
             break
         time.sleep(0.1)
 
@@ -972,7 +1742,7 @@ def run_pipeline(
 
     # Config canales
     rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(1))
-    rx1 = sdr.Channel(_bladerf.CHANNEL_RX(0))
+    rx1 = sdr.Channel(_bladerf.CHANNEL_RX(1)) #-----> pendiente, rx1 deja de ser RX(1)
 
     for ch in (rx1, rx_ch):
         ch.sample_rate = SDR_CONFIG["sample_rate"]
@@ -986,41 +1756,202 @@ def run_pipeline(
     buf = bytearray(1024 * SDR_CONFIG["bytes_per_sample"])
     transform = transform_spectrogram(device="cpu", **SPEC_CONFIG)
 
-    c = DOA_CONFIG["speed_of_light"]
-    d_cm = DOA_CONFIG["antenna_spacing_cm"]
-    block_size = DOA_CONFIG["block_size"]
-    angles = DOA_CONFIG["angles"]
-
     print(f"[Pipeline] Iniciando recepción ({blade_name}) (Two-stage: {TWO_STAGE_PREDICTION})")
+    print(f"[Pipeline] ═══════════════════════════════════════════════════")
 
-    # Historial para suavizado de predicciones
-    binary_results_list = []
-    multiclass_results_list = []
+    # Historial para suavizado de predicciones (por frecuencia)
+    binary_history_per_freq: Dict[float, List] = defaultdict(list)
+    multiclass_history_per_freq: Dict[float, List] = defaultdict(list)
+
+    # refresh_gps_cache(force=True)
+
+    # ========================================
+    # Función auxiliar: Ejecutar DOA en una frecuencia
+    # ========================================
+    def execute_doa_at_frequency(freq_hz: float, num_reads: int) -> tuple[Optional[float], Optional[float]]:
+        """
+        Ejecuta DOA en la frecuencia especificada.
+        Returns: (doa_angle, doa_psr) o (None, None) si falla
+        """
+        # Configurar para dual-channel
+
+        time.sleep(0.2)
+        # rx0.enable = False
+        # rx1.enable = False
+        # rx_ch.enable = False
+        #
+        # for ch in (rx0, rx1):
+        #     ch.frequency = int(freq_hz)
+        #
+        # sdr.sync_config(
+        #     layout=_bladerf.ChannelLayout.RX_X2,
+        #     fmt=_bladerf.Format.SC16_Q11,
+        #     num_buffers=32,
+        #     buffer_size=16384,
+        #     num_transfers=16,
+        #     stream_timeout=3500,
+        # )
+        # rx0.enable = True
+        # rx1.enable = True
+
+        spectra_acc = None
+        angles_list = []
+        valid_reads = 0
+        last_psr = 0.0
+
+        for _ in range(num_reads):
+            x1, x2 = capture_dual_channel(sdr, NUM_SAMPLES_DOA)
+
+            # Normalizar
+            x1 /= np.sqrt(np.mean(np.abs(x1) ** 2) + 1e-12)
+            x2 /= np.sqrt(np.mean(np.abs(x2) ** 2) + 1e-12)
+
+            X_full = np.stack([x1, x2], axis=1)
+            X_full = preprocess_iq(X_full, demean=True, normalize=True)
+
+            P_mvdr, theta_hat, psr_db, _ = estimate_doa_mvdr(
+                X_full,
+                fc_hz=FC_HZ,
+                d_m=D_M,
+                block_size=BLOCK_SIZE_MVDR,
+                angles_deg=ANGLES_DEG,
+                diag_load=DIAG_LOAD,
+            )
+
+            last_psr = psr_db
+
+            if psr_db < PSR_MIN_DB:
+                continue
+
+            if spectra_acc is None:
+                spectra_acc = P_mvdr.copy()
+            else:
+                spectra_acc += P_mvdr
+
+            angles_list.append(theta_hat)
+            valid_reads += 1
+
+        if valid_reads == 0:
+            return None, last_psr
+
+        # Clustering de ángulos
+        angles_arr = np.array(angles_list)
+        best_count = 0
+        best_mask = None
+
+        for center in angles_arr:
+            lower = center - WINDOW_WIDTH / 2.0
+            upper = center + WINDOW_WIDTH / 2.0
+            mask = (angles_arr >= lower) & (angles_arr <= upper)
+            count = mask.sum()
+            if count > best_count:
+                best_count = count
+                best_mask = mask
+
+        cluster_angles = angles_arr[best_mask]
+        doa_angle = float(cluster_angles.mean())
+
+        return doa_angle, last_psr
+
+    # ========================================
+    # LOOP PRINCIPAL
+    # ========================================
     try:
         while True:
             if stop_event is not None and stop_event.is_set():
                 print(f"[Pipeline] stop_event recibido, saliendo ({blade_name})")
                 break
 
-            # Seleccionar frecuencia y ventana de suavizado según modo
-            if mode == "scan":
-                window_size = SCAN_WINDOW
-                center_freq = scan_freqs[scan_index]
-                scan_index = (scan_index + 1) % len(scan_freqs)
-            else:  # mode == "track"
-                window_size = TRACK_WINDOW
-                if locked_freq is None:
-                    # Fallback: si por alguna razón no hay frecuencia bloqueada, volvemos a scan
-                    mode = "scan"
-                    window_size = SCAN_WINDOW
-                    center_freq = scan_freqs[scan_index]
-                    scan_index = (scan_index + 1) % len(scan_freqs)
-                else:
-                    center_freq = locked_freq
+            iteration_count += 1
+            iteration_start = time.time()
 
-            start_time = time.time()
-            print(f"\n[{blade_name}] MODO={mode.upper()} FRECUENCIA: {center_freq} Hz")
 
+
+            node_lat_deg = gps_cache["node_lat"]
+            node_lon_deg = gps_cache["node_lon"]
+            node_src = gps_cache["node_src"]
+
+            # ══════════════════════════════════════════════════════════════
+            # FASE 1: VERIFICACIÓN DE DRONES CONOCIDOS (solo DOA)
+            # ══════════════════════════════════════════════════════════════
+            known_frequencies = drone_tracker.get_known_frequencies()
+
+            if known_frequencies:
+                time.sleep(0.5)
+                print(f"\n[{blade_name}] ══ FASE VERIFICACIÓN ({len(known_frequencies)} drones) ══")
+
+                for freq in known_frequencies:
+                    drone = drone_tracker.get_drone_at_frequency(freq)
+                    if drone is None:
+                        continue
+
+                    verify_start = time.time()
+                    print(f"[{blade_name}] 🔍 Verificando {drone.drone_id} @ {freq / 1e6:.0f} MHz...", end=" ")
+
+                    # Ejecutar solo DOA (rápido)
+                    doa_angle, doa_psr = execute_doa_at_frequency(freq, NUM_READS_VERIFY)
+
+                    if doa_angle is not None:
+                        # DOA válido - actualizar tracker
+                        time.sleep(0.5)
+                        drone_tracker.update_doa_verification(freq, doa_angle, doa_psr)
+                        print(f"✅ DOA: {doa_angle:.1f}° ({time.time() - verify_start:.2f}s)")
+
+                        # Publicar DOA actualizado
+                        publish_doa(
+                            doa_angle,
+                            blade_serial=blade_serial,
+                            center_freq_hz=freq,
+                            psr_db=doa_psr,
+                        )
+                        publish_drone_detection(drone, blade_name)
+
+                        tri = tri_update_and_solve(
+                            freq_hz=freq,
+                            blade_serial=blade_serial,
+                            doa_local_deg=doa_angle,
+                            node_lat=node_lat_deg,
+                            node_lon=node_lon_deg,
+                            heading_deg=fixed_heading_deg
+                        )
+                        if tri:
+                            print(
+                                f"[{blade_name}] 📍 TRIANGULACIÓN @ {freq / 1e6:.0f} MHz → lat={tri.lat_deg:.7f}, lon={tri.lon_deg:.7f}")
+                        #     # aquí ya tienes (lat, lon) del emisor
+                    # else:
+                    #     # DOA inválido - marcar fallo
+                    #     was_removed = drone_tracker.mark_verification_failed(freq)
+                    #     if was_removed:
+                    #         print(f"❌ ELIMINADO (demasiados fallos)")
+                    #     else:
+                    #         print(f"⚠️  Fallo (PSR: {doa_psr:.1f} dB)")
+
+            # ══════════════════════════════════════════════════════════════
+            # FASE 2: BARRIDO (descubrimiento de nuevos drones)
+            # ══════════════════════════════════════════════════════════════
+            center_freq = scan_freqs[scan_index]
+            scan_index = (scan_index + 1) % len(scan_freqs)
+
+            # Detectar inicio de nuevo ciclo de barrido
+            is_new_sweep = (scan_index == 0)
+            if is_new_sweep and iteration_count > 1:
+                print(f"\n[{blade_name}] ═══════════ NUEVO CICLO DE BARRIDO ═══════════")
+                summary = drone_tracker.get_summary()
+                if summary["total_active"] > 0:
+                    print(f"[{blade_name}] 📊 Drones activos: {summary['total_active']} "
+                          f"(confirmados: {summary['confirmed']}, tentative: {summary['tentative']})")
+                    for d in summary["drones"]:
+                        status_icon = "✅" if d["status"] == "confirmed" else "⏳"
+                        doa_str = f"DOA: {d['doa_angle']:.1f}°" if d["doa_angle"] is not None else "DOA: N/A"
+                        print(
+                            f"    {status_icon} {d['drone_id']}: {d['drone_class']} @ {d['frequency_hz'] / 1e6:.0f} MHz | {doa_str}")
+
+            scan_start = time.time()
+            print(f"\n[{blade_name}] ══ FASE BARRIDO → {center_freq / 1e6:.0f} MHz (iter {iteration_count}) ══")
+
+            # ========================================
+            # Configurar SDR para single-channel
+            # ========================================
             rx0.enable = False
             rx1.enable = False
             rx_ch.enable = False
@@ -1039,7 +1970,9 @@ def run_pipeline(
             rx1.enable = False
             rx_ch.enable = True
 
-            # ----------- Captura de muestras -----------
+            # ========================================
+            # Captura de muestras IQ
+            # ========================================
             x = np.zeros(SDR_CONFIG["num_samples"], dtype=np.complex64)
             num_samples_read = 0
 
@@ -1055,12 +1988,17 @@ def run_pipeline(
                 x[num_samples_read:num_samples_read + num] = samples[0:num]
                 num_samples_read += num
 
+            # ========================================
+            # Espectrograma + Predicción
+            # ========================================
             I = np.real(x)
             Q = np.imag(x)
             sample = torch.tensor(np.stack([I, Q], axis=0))
             spec = transform(sample)
 
-            # === Predicción ===
+            binary_results_list = binary_history_per_freq[center_freq]
+            multiclass_results_list = multiclass_history_per_freq[center_freq]
+
             if TWO_STAGE_PREDICTION:
                 (
                     final_class_name,
@@ -1077,26 +2015,20 @@ def run_pipeline(
                     BINARY_CONFIDENCE_THRESHOLD,
                     binary_results_list,
                     multiclass_results_list,
-                    window_size=window_size,
-                )
-                print(
-                    f"\n[{blade_name}] [Stage 1] {binary_result['class_name']} "
-                    f"(conf={binary_result['confidence']:.4f})"
+                    window_size=SCAN_WINDOW,
                 )
 
+                binary_history_per_freq[center_freq] = binary_results_list
+                multiclass_history_per_freq[center_freq] = multiclass_results_list
+
+                print(f"[{blade_name}] [Stage 1] {binary_result['class_name']} "
+                      f"(conf={binary_result['confidence']:.4f})")
 
                 if multiclass_result:
-                    drone_predict_raw = multiclass_result['class_name']
-                    drone_confidence_raw = multiclass_result['confidence']
-                    drone_predict = multiclass_result_smoothed['confidence']
-                    drone_confidence = multiclass_result_smoothed['class_name']  # Update final class name if smoothed
-                    print(
-                        f"[{blade_name}] [Stage 2] {multiclass_result['class_name']} "
-                        f"(conf={multiclass_result['confidence']:.4f})"
-                    )
+                    print(f"[{blade_name}] [Stage 2] {multiclass_result['class_name']} "
+                          f"(conf={multiclass_result['confidence']:.4f})")
 
                 drone_predict = final_class_name
-                # Usamos la confianza del binario suavizado como valor principal
                 drone_confidence = (
                     binary_result_smoothed["confidence"]
                     if binary_result_smoothed is not None
@@ -1105,23 +2037,6 @@ def run_pipeline(
 
                 print(f"[{blade_name}] [Final] {drone_predict} (conf={drone_confidence:.4f})")
 
-                publish_pred(
-                    label_name=drone_predict,
-                    confidence=drone_confidence,
-                    binary_info=binary_result_smoothed,
-                    multiclass_info=multiclass_result_smoothed,
-                    center_freq=float(center_freq),
-                    mode=mode,
-                )
-
-                # Etiqueta para la imagen del espectrograma (solo debug)
-                label_for_plot = f"Final: {drone_predict} ({drone_confidence:.2f})"
-                visualize_spectrogram(
-                    spectrogram=spec.unsqueeze(0),
-                    class_name=label_for_plot,
-                    blade_id=blade_name,
-                    **VIS_CONFIG,
-                )
             else:
                 with torch.no_grad():
                     spec_input = spec.unsqueeze(0).unsqueeze(0)
@@ -1132,17 +2047,15 @@ def run_pipeline(
                 drone_predict = CLASS_DICTS["multiclass"][preds.item()]
                 drone_confidence = probs[0, preds.item()].item()
                 print(f"[{blade_name}] [Prediction] {drone_predict} (conf={drone_confidence:.4f})")
-                publish_pred(
-                    label_name=drone_predict,
-                    confidence=drone_confidence,
-                    center_freq=float(center_freq),
-                    mode=mode,
-                )
 
-            # ----------- PSD → backend -----------
+            # ========================================
+            # PSD → backend
+            # ========================================
             publish_psd(x, center_freq, SDR_CONFIG["sample_rate"], nfft=1024, drone_id=drone_predict)
 
-            # ----------- Spectrogram → backend -----------
+            # ========================================
+            # Spectrogram → backend
+            # ========================================
             try:
                 spec_frame = build_spectrogram_frame(
                     spectrogram=spec.unsqueeze(0),
@@ -1152,154 +2065,113 @@ def run_pipeline(
             except Exception as e:
                 print("[pipeline] publish_spec error:", e)
 
-            # ----------- DOA (solo si no es Noise/Jammer) -----------
-            if drone_predict not in ["Noise", "Jammer"]:
-                spectra_acc = None  # acumular espectros MVDR
-                angles_list = []  # ángulos válidos
-                valid_reads = 0
-
-                for i in range(NUM_READS):
-
-                    rx0.enable = False
-                    rx1.enable = False
-                    sdr.sync_config(
-                        layout=_bladerf.ChannelLayout.RX_X2,
-                        fmt=_bladerf.Format.SC16_Q11,
-                        num_buffers=32,
-                        buffer_size=16384,
-                        num_transfers=16,
-                        stream_timeout=3500,
-                    )
-                    rx0.enable = True
-                    rx1.enable = True
-
-                    x1, x2 = capture_dual_channel(sdr, NUM_SAMPLES_DOA)
-
-                    # Normalizar potencia
-                    x1 /= np.sqrt(np.mean(np.abs(x1) ** 2) + 1e-12)
-                    x2 /= np.sqrt(np.mean(np.abs(x2) ** 2) + 1e-12)
-
-                    # Matriz de datos para MVDR: (K, M) = (N, 2)
-                    X_full = np.stack([x1, x2], axis=1)  # (K, 2)
-                    X_full = preprocess_iq(X_full, demean=True, normalize=True)
-
-                    P_mvdr, theta_hat, psr_db, d_lambda = estimate_doa_mvdr(
-                        X_full,
-                        fc_hz=FC_HZ,
-                        d_m=D_M,
-                        block_size=BLOCK_SIZE_MVDR,
-                        angles_deg=ANGLES_DEG,
-                        diag_load=DIAG_LOAD,
-                    )
-
-                    # print(f"[MVDR] PSR = {psr_db:.1f} dB, theta_hat = {theta_hat:.2f}°")
-
-                    # Filtro de calidad
-                    if psr_db < PSR_MIN_DB:
-                        # print("   -> Lectura descartada (PSR demasiado bajo)")
-                        continue
-
-                    # Acumular espectro y ángulo
-                    if spectra_acc is None:
-                        spectra_acc = P_mvdr.copy()
-                    else:
-                        spectra_acc += P_mvdr
-
-                    angles_list.append(theta_hat)
-                    valid_reads += 1
-
-                if valid_reads == 0:
-                    print("\n[DOA MVDR] No se obtuvo ninguna lectura confiable.")
-                    continue
-
-                    # Espectro promedio
-                P_mvdr_mean = spectra_acc / valid_reads
-
-                # Array de ángulos
-                angles_arr = np.array(angles_list)
-
-                # ==========================================
-                # Buscar el "ángulo más común" por clusters
-                # ==========================================
-                best_count = 0
-                best_mask = None
-
-                for center in angles_arr:
-                    lower = center - WINDOW_WIDTH / 2.0
-                    upper = center + WINDOW_WIDTH / 2.0
-                    mask = (angles_arr >= lower) & (angles_arr <= upper)
-                    count = mask.sum()
-                    if count > best_count:
-                        best_count = count
-                        best_mask = mask
-
-                cluster_angles = angles_arr[best_mask]
-                theta_cluster_mean = float(cluster_angles.mean())
-
-                print("\n[DOA MVDR] Lecturas válidas:", valid_reads)
-                print("   Ángulos individuales (deg):", angles_arr)
-                print(
-                    f"   Grupo más denso dentro de ±{WINDOW_WIDTH / 2:.1f}° → {cluster_angles}"
-                )
-                print(
-                    f"   Ángulo 'más común' (media del grupo): {theta_cluster_mean:.2f}°"
-                )
-
-
-
-
-            # ----------- Actualizar estado SCAN / TRACK -----------
-            # Consideramos que hay "dron presente" si la clase final NO es Noise/Jammer
+            # ========================================
+            # LÓGICA DE DETECCIÓN
+            # ========================================
             drone_present = drone_predict not in ["Noise", "Jammer"]
+            doa_angle = None
+            doa_psr = None
 
-            if mode == "scan":
-                if drone_present:
-                    consecutive_hits += 1
-                    last_detection_freq = center_freq
-                    print(
-                        f"[{blade_name}] SCAN: detección en {center_freq} Hz "
-                        f"({consecutive_hits}/{LOCK_CONSECUTIVE})"
-                    )
-                    if consecutive_hits >= LOCK_CONSECUTIVE:
-                        mode = "track"
-                        locked_freq = center_freq
-                        consecutive_hits = 0
-                        consecutive_misses = 0
-                        print(f"[{blade_name}] >>> Cambio a modo TRACK en {locked_freq} Hz")
-                else:
-                    if consecutive_hits > 0:
-                        print(f"[{blade_name}] SCAN: detección interrumpida, reseteando contador.")
-                    consecutive_hits = 0
-            else:
-                if drone_present:
-                    consecutive_misses = 0
-                    last_detection_freq = center_freq
-                else:
-                    consecutive_misses += 1
-                    print(
-                        f"[{blade_name}] TRACK: pérdida {consecutive_misses}/{LOST_CONSECUTIVE} "
-                        f"en {center_freq} Hz"
-                    )
-                    if consecutive_misses >= LOST_CONSECUTIVE:
-                        print(
-                            f"[{blade_name}] >>> Dron perdido en {center_freq} Hz, "
-                            f"volviendo a modo SCAN."
+            if drone_present:
+                # Verificar si es un dron NUEVO o ya conocido
+                existing_drone = drone_tracker.get_drone_at_frequency(center_freq)
+
+                if existing_drone is None:
+                    # NUEVO DRON - ejecutar DOA completo
+
+                    print(f"[{blade_name}] 🎯 NUEVO DRON en {center_freq / 1e6:.0f} MHz - Ejecutando DOA...")
+                    doa_angle, doa_psr = execute_doa_at_frequency(center_freq, NUM_READS_DISCOVER)
+
+                    if doa_angle is not None:
+                        print(f"[{blade_name}] [DOA] Ángulo: {doa_angle:.1f}°")
+                        publish_doa(
+                            doa_angle,
+                            blade_serial=blade_serial,
+                            center_freq_hz=center_freq,
+                            psr_db=doa_psr,
                         )
-                        mode = "scan"
-                        locked_freq = None
-                        consecutive_hits = 0
-                        consecutive_misses = 0
-                        # Reanudar scan desde la frecuencia siguiente a la última detección
-                        if last_detection_freq is not None and scan_freqs:
-                            try:
-                                idx = scan_freqs.index(int(last_detection_freq))
-                                scan_index = (idx + 1) % len(scan_freqs)
-                            except ValueError:
-                                # Si por alguna razón no está exacta en la lista (redondeos), no pasa nada
-                                pass
 
-            elapsed = time.time() - start_time
-            print(f"[{blade_name}] Tiempo de procesamiento: {elapsed:.3f} s\n")
+                        tri = tri_update_and_solve(
+                            freq_hz=center_freq,
+                            blade_serial=blade_serial,
+                            doa_local_deg=doa_angle,
+                            node_lat=node_lat_deg,
+                            node_lon=node_lon_deg,
+                            heading_deg=fixed_heading_deg
+                        )
+                        if tri:
+                            print(
+                                f"[{blade_name}] 📍 TRIANGULACIÓN @ {freq / 1e6:.0f} MHz → lat={tri.lat_deg:.7f}, lon={tri.lon_deg:.7f}")
+                            # aquí ya tienes (lat, lon) del emisor
+                    else:
+                        print(f"[{blade_name}] [DOA] Sin lecturas válidas")
+
+                    # Agregar al tracker
+                    detected_drone = drone_tracker.update_detection(
+                        frequency_hz=center_freq,
+                        drone_class=drone_predict,
+                        confidence=drone_confidence,
+                        doa_angle=doa_angle,
+                        doa_psr_db=doa_psr
+                    )
+                    publish_drone_detection(detected_drone, blade_name)
+                else:
+                    # DRON CONOCIDO - solo actualizar predicción (DOA ya se hizo en fase verificación)
+                    print(f"[{blade_name}] 📡 Dron conocido {existing_drone.drone_id} confirmado en barrido")
+                    drone_tracker.update_detection(
+                        frequency_hz=center_freq,
+                        drone_class=drone_predict,
+                        confidence=drone_confidence,
+                        doa_angle=existing_drone.doa_angle,  # Mantener DOA existente
+                        doa_psr_db=existing_drone.doa_psr_db
+                    )
+
+                # Publicar predicción
+                publish_pred(
+                    label_name=drone_predict,
+                    confidence=drone_confidence,
+                    binary_info=binary_result_smoothed if TWO_STAGE_PREDICTION else None,
+                    multiclass_info=multiclass_result_smoothed if TWO_STAGE_PREDICTION else None,
+                    center_freq=float(center_freq),
+                    mode="hybrid_scan",
+                )
+
+                # Visualizar espectrograma
+                label_for_plot = f"{drone_predict} ({drone_confidence:.2f}) @ {center_freq / 1e6:.0f}MHz"
+                visualize_spectrogram(
+                    spectrogram=spec.unsqueeze(0),
+                    class_name=label_for_plot,
+                    blade_id=blade_name,
+                    **VIS_CONFIG,
+                )
+            else:
+                # No hay dron - publicar Noise/Jammer
+                publish_pred(
+                    label_name=drone_predict,
+                    confidence=drone_confidence,
+                    binary_info=binary_result_smoothed if TWO_STAGE_PREDICTION else None,
+                    multiclass_info=multiclass_result_smoothed if TWO_STAGE_PREDICTION else None,
+                    center_freq=float(center_freq),
+                    mode="hybrid_scan",
+                )
+
+            # ========================================
+            # Limpieza periódica
+            # ========================================
+            if iteration_count % CLEANUP_INTERVAL == 0:
+                lost_drones = drone_tracker.cleanup_lost_drones()
+                if lost_drones:
+                    print(f"[{blade_name}] 🧹 Limpieza: {len(lost_drones)} dron(es) perdidos por timeout")
+
+            # ========================================
+            # Publicar estado completo
+            # ========================================
+            # publish_multi_drone(drone_tracker, blade_name)
+
+            # Tiempo total de iteración
+            iteration_elapsed = time.time() - iteration_start
+            scan_elapsed = time.time() - scan_start
+            print(f"[{blade_name}] ⏱️  Barrido: {scan_elapsed:.2f}s | Total iteración: {iteration_elapsed:.2f}s")
 
     except Exception as e:
         import traceback
