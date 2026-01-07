@@ -9,6 +9,8 @@ import shutil
 import subprocess
 from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
+import math
+import inspect
 
 import numpy as np
 import requests
@@ -19,6 +21,7 @@ from scipy.signal import correlate
 from bladerf import _bladerf
 from collections import Counter, defaultdict
 from app.util.orientation import get_orientation
+from app.util.triangulation import estimate_emitter_latlon_enu_ls
 
 # ================================================================
 # Cargar libbladeRF
@@ -71,13 +74,13 @@ MODEL_CONFIGS = {
     "binary": {
         "path": os.getenv(
             "BINARY_MODEL_PATH",
-            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_BIN-UNF1-(IQSignal_DroneDetectSNR).pt",
+            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/model_traced_binary.pt",
         )
     },
     "multiclass": {
         "path": os.getenv(
             "MULTICLASS_MODEL_PATH",
-            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/ConvNeXtTiny_traced_MC-UNF5-(IQSig_DroneDetectSNR).pt",
+            "/Users/juanjosesanchezpineda/Documents/WorkSpace/morpheus-rf-api/weights/model_traced.pt",
         )
     },
 }
@@ -181,6 +184,28 @@ ANGLES_DEG = np.linspace(-90, 90, 721)  # malla fina
 DIAG_LOAD = 1e-3
 
 
+NODE_GPS_ALL_CAPTURE_URL = os.getenv(
+    "NODE_GPS_ALL_CAPTURE_URL",
+    "http://127.0.0.1:8000/node/gps/all/capture",
+)
+NODE_GPS_SAMPLES = int(os.getenv("NODE_GPS_SAMPLES", "5"))
+NODE_GPS_REFRESH_S = float(os.getenv("NODE_GPS_REFRESH_S", "3.0"))
+
+PIPELINE_NODE_PORT = os.getenv("PIPELINE_NODE_PORT")  # e.g. NODE_LEFT | NODE_RIGHT
+# Alternativa por lado:
+PIPELINE_NODE_SIDE = (os.getenv("PIPELINE_NODE_SIDE", "") or "").strip().lower()  # left|right
+
+# Si NO llegan 2 nodos o quieres fallback tipo frontend:
+NODE_OFFSET_M = float(os.getenv("NODE_OFFSET_M", "10.0"))  # 10m izquierda / 10m derecha
+
+
+
+# ============================
+# GPS FALLBACK (ubicación "quemada")
+# ============================
+FALLBACK_CITY = os.getenv("FALLBACK_CITY", "Medellín, Colombia")
+FALLBACK_LAT = float(os.getenv("FALLBACK_LAT", "6.244203"))
+FALLBACK_LON = float(os.getenv("FALLBACK_LON", "-75.581212"))
 
 
 # ================================================================
@@ -494,7 +519,7 @@ except Exception as e:
 
 
 # ================================================================
-# Helpers PSD / SPEC / PRED / DOA
+# Helpers PSD / SPEC / PRED / DOA / GPS
 # ================================================================
 def _compute_psd_db(x: np.ndarray, nfft: int = 4096) -> np.ndarray:
     if x.ndim != 1:
@@ -530,8 +555,23 @@ def publish_psd(
         print("[pipeline] ingest error:", e)
 
 
-def publish_doa(angle_deg: float) -> None:
-    body = {"angle_deg": float(angle_deg)}
+def publish_doa(
+    angle_deg: float,
+    *,
+    blade_serial: str,
+    center_freq_hz: Optional[float] = None,
+    psr_db: Optional[float] = None,
+) -> None:
+    body: Dict[str, Any] = {
+        "angle_deg": float(angle_deg),
+        "blade_serial": str(blade_serial),
+        "capture_time_sec": time.time(),
+    }
+    if center_freq_hz is not None:
+        body["center_freq_hz"] = float(center_freq_hz)
+    if psr_db is not None:
+        body["psr_db"] = float(psr_db)
+
     try:
         requests.post(DOA_INGEST_URL, json=body, timeout=0.5)
     except Exception as e:
@@ -591,6 +631,284 @@ def build_spectrogram_frame(spectrogram: torch.Tensor, class_name: str) -> dict:
         "pmax": pmax,
         "data": spec_np.tolist(),
     }
+
+
+def get_connected_blades() -> List[Dict[str, Any]]:
+    devinfos = _bladerf.get_device_list()
+    devices: List[Dict[str, Any]] = []
+    for info in devinfos:
+        devices.append({
+            "serial": _devinfo_serial_str(info),
+            "backend": getattr(info, "backend", None),
+            "usb_bus": getattr(info, "usb_bus", None),
+            "usb_addr": getattr(info, "usb_addr", None),
+        })
+    return devices
+
+def count_connected_blades() -> int:
+    return len(_bladerf.get_device_list())
+
+def count_unique_blades_by_serial() -> int:
+    devinfos = _bladerf.get_device_list()
+    serials = [_devinfo_serial_str(i) for i in devinfos]
+    return len(set(serials))
+
+
+def _normalize_bearing_deg(x: float) -> float:
+    x = float(x) % 360.0
+    return x + 360.0 if x < 0 else x
+
+
+def _destination(lon_deg: float, lat_deg: float, bearing_deg: float, distance_m: float) -> tuple[float, float]:
+    """
+    Destino geodésico simple (esfera). Retorna (lon, lat) en grados.
+    """
+    R = 6371000.0
+    brng = math.radians(_normalize_bearing_deg(bearing_deg))
+    lat1 = math.radians(lat_deg)
+    lon1 = math.radians(lon_deg)
+
+    dr = distance_m / R
+    lat2 = math.asin(math.sin(lat1) * math.cos(dr) + math.cos(lat1) * math.sin(dr) * math.cos(brng))
+    lon2 = lon1 + math.atan2(
+        math.sin(brng) * math.sin(dr) * math.cos(lat1),
+        math.cos(dr) - math.sin(lat1) * math.sin(lat2),
+    )
+
+    return (math.degrees(lon2), math.degrees(lat2))
+
+
+def _fetch_all_nodes_positions_http(n_samples: int, timeout_s: float = 1.5) -> dict:
+    """
+    Llama al endpoint que trae todas las posiciones de nodos GPS.
+    Espera un JSON tipo:
+      { count: N, devices: [ {port, ok, data:{avg:{lat,lon}}, n_samples}, ... ] }
+    """
+    url = f"{NODE_GPS_ALL_CAPTURE_URL}/{int(n_samples)}"
+    r = requests.get(url, timeout=timeout_s)
+    r.raise_for_status()
+    return r.json()
+
+
+def _parse_nodes_payload(payload: dict) -> dict:
+    """
+    Retorna dict: port -> {"lat": float, "lon": float}
+    Solo para devices ok con lat/lon.
+    """
+    out = {}
+    for dev in (payload or {}).get("devices", []) or []:
+        port = dev.get("port") or "UNKNOWN"
+        ok = bool(dev.get("ok"))
+        data = dev.get("data") or {}
+        avg = data.get("avg") or {}
+        lat = avg.get("lat")
+        lon = avg.get("lon")
+        if ok and lat is not None and lon is not None:
+            out[str(port)] = {"lat": float(lat), "lon": float(lon)}
+    return out
+
+
+def _mean_latlon(pos_by_port: dict) -> tuple[float, float] | tuple[None, None]:
+    if not pos_by_port:
+        return None, None
+    lats = [v["lat"] for v in pos_by_port.values()]
+    lons = [v["lon"] for v in pos_by_port.values()]
+    return sum(lats) / len(lats), sum(lons) / len(lons)
+
+
+def _compute_left_right_from_avg(avg_lat: float, avg_lon: float, heading_deg: float, offset_m: float) -> dict:
+    """
+    Genera posiciones sintéticas:
+      left  = avg desplazado heading-90
+      right = avg desplazado heading+90
+    Retorna dict con llaves NODE_LEFT/NODE_RIGHT.
+    """
+    axis = _normalize_bearing_deg(heading_deg)
+    left_lon, left_lat = _destination(avg_lon, avg_lat, axis - 90.0, offset_m)
+    right_lon, right_lat = _destination(avg_lon, avg_lat, axis + 90.0, offset_m)
+    return {
+        "NODE_LEFT": {"lat": float(left_lat), "lon": float(left_lon)},
+        "NODE_RIGHT": {"lat": float(right_lat), "lon": float(right_lon)},
+    }
+
+
+def _pick_node_position_for_this_blade(
+    blade_name: str,
+    pos_by_port: dict,
+    *,
+    heading_deg: float = 0.0,
+    offset_m: float = NODE_OFFSET_M,
+    node_port: str | None = None,
+    node_side: str | None = None,
+) -> tuple[float | None, float | None, str]:
+    """
+    Decide la posición (lat, lon) de ESTE blade.
+
+    Prioridad:
+      1) node_port explícito (PIPELINE_NODE_PORT o param)
+      2) node_side left/right (PIPELINE_NODE_SIDE o param) buscando NODE_LEFT/NODE_RIGHT
+      3) heurística por nombre del blade (contiene "left"/"right")
+      4) si no hay 2 nodos claros: promedio + sintetiza LEFT/RIGHT a ±offset_m con heading
+      5) fallback: si hay al menos 1 nodo, usar el primero
+    """
+    node_port = node_port or PIPELINE_NODE_PORT
+    node_side = (node_side or PIPELINE_NODE_SIDE or "").strip().lower()
+
+    # 1) Port explícito
+    if node_port and node_port in pos_by_port:
+        p = pos_by_port[node_port]
+        return p["lat"], p["lon"], f"port:{node_port}"
+
+    # 2) Side explícito
+    if node_side in ("left", "right"):
+        key = "NODE_LEFT" if node_side == "left" else "NODE_RIGHT"
+        if key in pos_by_port:
+            p = pos_by_port[key]
+            return p["lat"], p["lon"], f"side:{node_side} (real:{key})"
+
+    # 3) Heurística por nombre
+    bn = (blade_name or "").lower()
+    if "left" in bn and "NODE_LEFT" in pos_by_port:
+        p = pos_by_port["NODE_LEFT"]
+        return p["lat"], p["lon"], "name:left (real:NODE_LEFT)"
+    if "right" in bn and "NODE_RIGHT" in pos_by_port:
+        p = pos_by_port["NODE_RIGHT"]
+        return p["lat"], p["lon"], "name:right (real:NODE_RIGHT)"
+
+    # 4) Sintetizar LEFT/RIGHT desde promedio si no están
+    avg_lat, avg_lon = _mean_latlon(pos_by_port)
+    if avg_lat is not None and avg_lon is not None:
+        synth = _compute_left_right_from_avg(avg_lat, avg_lon, heading_deg, offset_m)
+        if node_side in ("left", "right"):
+            key = "NODE_LEFT" if node_side == "left" else "NODE_RIGHT"
+            p = synth[key]
+            return p["lat"], p["lon"], f"side:{node_side} (synthetic)"
+        # Si no hay side, pero el nombre sugiere:
+        if "left" in bn:
+            p = synth["NODE_LEFT"]
+            return p["lat"], p["lon"], "name:left (synthetic)"
+        if "right" in bn:
+            p = synth["NODE_RIGHT"]
+            return p["lat"], p["lon"], "name:right (synthetic)"
+        # Si nada: devolver el promedio
+        return avg_lat, avg_lon, "avg(all_nodes)"
+
+    # 5) fallback: primer nodo disponible
+    if pos_by_port:
+        first_port = sorted(pos_by_port.keys())[0]
+        p = pos_by_port[first_port]
+        return p["lat"], p["lon"], f"fallback:first_port:{first_port}"
+
+    return None, None, "no_gps_available"
+
+
+def _safe_call_triangulation(fn, **kwargs):
+    """
+    Llama estimate_emitter_latlon_enu_ls filtrando kwargs por signature (para no romper).
+    """
+    try:
+        sig = inspect.signature(fn)
+        filtered = {k: v for k, v in kwargs.items() if k in sig.parameters}
+        return fn(**filtered)
+    except Exception as e:
+        print("[Triangulation] error:", e)
+        return None
+
+# ============================
+# TRIANGULATION SHARED BUFFER (entre hilos de blades)
+# ============================
+TRI_LOCK = threading.Lock()
+
+TRI_TTL_S = float(os.getenv("TRI_TTL_S", "1.0"))            # ventana de tiempo para considerar DOAs "simultáneos"
+TRI_MIN_NODES = int(os.getenv("TRI_MIN_NODES", "2"))        # mínimo de nodos para triangular
+TRI_FREQ_TOL_HZ = float(os.getenv("TRI_FREQ_TOL_HZ", "5e6"))# tolerancia por frecuencia (ej 5 MHz)
+
+# bucket_freq -> serial -> obs
+TRI_OBS: Dict[float, Dict[str, Dict[str, float]]] = {}
+
+def _tri_bucket(freq_hz: float) -> float:
+    return float(round(freq_hz / TRI_FREQ_TOL_HZ) * TRI_FREQ_TOL_HZ)
+
+def tri_update_and_solve(
+    *,
+    freq_hz: float,
+    blade_serial: str,
+    doa_local_deg: float,
+    node_lat: Optional[float],
+    node_lon: Optional[float],
+    heading_deg: float = 0.0,
+):
+    """
+    1) Guarda (DOA, lat, lon, heading) del blade actual en un buffer compartido.
+    2) Si hay >= TRI_MIN_NODES observaciones recientes para la misma freq (bucket),
+       llama estimate_emitter_latlon_enu_ls y retorna TriangulationResult.
+    """
+    if node_lat is None or node_lon is None:
+        return None
+
+    now = time.time()
+    key = _tri_bucket(freq_hz)
+
+    with TRI_LOCK:
+        bucket = TRI_OBS.setdefault(key, {})
+        bucket[str(blade_serial)] = {
+            "ts": float(now),
+            "doa": float(doa_local_deg),
+            "lat": float(node_lat),
+            "lon": float(node_lon),
+            "heading": float(heading_deg),
+        }
+
+        # limpiar stale
+        for s in list(bucket.keys()):
+            if now - bucket[s]["ts"] > TRI_TTL_S:
+                bucket.pop(s, None)
+
+        if len(bucket) < TRI_MIN_NODES:
+            return None
+
+        obs = list(bucket.values())
+
+    # IMPORTANTE: este doa_local_deg debe ser consistente con tu heading (0=N, 90=E) según tu doc
+    return _safe_call_triangulation(
+        estimate_emitter_latlon_enu_ls,
+        n_active=len(obs),
+        doa_local_deg=[o["doa"] for o in obs],
+        node_lat_deg=[o["lat"] for o in obs],
+        node_lon_deg=[o["lon"] for o in obs],
+        heading_deg=[o["heading"] for o in obs],
+        earth_radius_m=6_371_000.0,
+    )
+
+# ============================
+# ORIENTACIÓN (solo una vez, cacheada por proceso)
+# ============================
+_ORI_LOCK = threading.Lock()
+_ORI_HEADING_DEG: Optional[float] = None
+
+def get_fixed_heading_deg() -> float:
+    """
+    Lee el heading del BNO055 UNA sola vez (por proceso) y lo reutiliza.
+    """
+    global _ORI_HEADING_DEG
+
+    with _ORI_LOCK:
+        if _ORI_HEADING_DEG is not None:
+            return _ORI_HEADING_DEG
+
+        try:
+            samples = int(os.getenv("BNO055_SAMPLES", "5"))
+            h = get_orientation(samples=samples)  # <-- tu función retorna float
+            if h is None or (isinstance(h, float) and math.isnan(h)):
+                raise ValueError("heading inválido (NaN/None)")
+
+            _ORI_HEADING_DEG = _normalize_bearing_deg(float(h))
+            print(f"[Orientation] ✅ Heading fijo: {_ORI_HEADING_DEG:.2f}° (samples={samples})")
+        except Exception as e:
+            _ORI_HEADING_DEG = 0.0
+            print(f"[Orientation] ⚠️ No se pudo leer BNO055, usando 0.0° | error: {e}")
+
+        return _ORI_HEADING_DEG
 
 
 # =============================================================================
@@ -1138,7 +1456,7 @@ def _open_bladerf_from_env(dev_id: Optional[str]):
             try:
                 dev = _bladerf.BladeRF(devinfo=info)
                 print(f"[SDR] Dispositivo abierto: {dev}")
-                return dev
+                return dev, serial_str
             except Exception as e:
                 print(f"[SDR] Error abriendo dispositivo con ese serial: {e}")
                 raise RuntimeError("Failed to open bladeRF") from e
@@ -1231,10 +1549,13 @@ def capture_dual_channel(sdr: _bladerf.BladeRF, num_samples: int) -> tuple[np.nd
 # run_pipeline: para usarlo desde FastAPI en hilos
 # ================================================================
 def run_pipeline(
-        dev_id: Optional[str] = None,
-        device_name: Optional[str] = None,
-        stop_event: Optional[threading.Event] = None,
-
+    dev_id: Optional[str] = None,
+    device_name: Optional[str] = None,
+    stop_event: Optional[threading.Event] = None,
+    node_port: Optional[str] = None,
+    node_side: Optional[str] = None,
+    gps_port: Optional[str] = None,     # ✅ NUEVO
+    gps_baud: int = 4800,               # ✅ NUEVO
 ) -> None:
     """
     Bucle principal del pipeline. Bloqueante. Pensado para correrse en un hilo.
@@ -1276,6 +1597,95 @@ def run_pipeline(
     effective_dev_id = dev_id or os.getenv("BLADERF_DEVICE")
     blade_name = device_name or os.getenv("PIPELINE_DEVICE_NAME", effective_dev_id or "default_blade")
 
+    fixed_heading_deg = get_fixed_heading_deg()
+    # ✅ Cargar GPS al inicio (o fallback Medellín)
+
+
+    gps_cache = {
+        "last_fetch": 0.0,
+        "pos_by_port": {},  # port -> {lat, lon}
+        "last_debug": "init",
+        "node_lat": None,
+        "node_lon": None,
+        "node_src": "init",
+    }
+
+    def refresh_gps_cache(force: bool = False):
+        now = time.time()
+        if (not force) and (now - gps_cache["last_fetch"] < NODE_GPS_REFRESH_S):
+            return
+
+        heading_deg = fixed_heading_deg
+
+        try:
+            payload = _fetch_all_nodes_positions_http(NODE_GPS_SAMPLES, timeout_s=1.5)
+            pos_by_port = _parse_nodes_payload(payload)
+
+            # ✅ Si no hay nodos reales, usamos Medellín y sintetizamos LEFT/RIGHT
+            if not pos_by_port:
+                pos_by_port = _compute_left_right_from_avg(
+                    FALLBACK_LAT,
+                    FALLBACK_LON,
+                    heading_deg,
+                    NODE_OFFSET_M,
+                )
+                src_note = f"fallback:{FALLBACK_CITY} (synthetic LEFT/RIGHT)"
+            else:
+                src_note = "gps:nodes_http"
+
+            node_lat, node_lon, src = _pick_node_position_for_this_blade(
+                blade_name=blade_name,
+                pos_by_port=pos_by_port,
+                heading_deg=heading_deg,
+                offset_m=NODE_OFFSET_M,
+                node_port=node_port,
+                node_side=node_side,
+            )
+
+            # ✅ Si por alguna razón sigue None, forzamos fallback Medellín promedio
+            if node_lat is None or node_lon is None:
+                synth = _compute_left_right_from_avg(FALLBACK_LAT, FALLBACK_LON, heading_deg, NODE_OFFSET_M)
+                node_lat, node_lon, src2 = _pick_node_position_for_this_blade(
+                    blade_name=blade_name,
+                    pos_by_port=synth,
+                    heading_deg=heading_deg,
+                    offset_m=NODE_OFFSET_M,
+                    node_port=node_port,
+                    node_side=node_side,
+                )
+                src = f"{src2} | fallback:{FALLBACK_CITY}"
+                pos_by_port = synth
+                src_note = f"fallback:{FALLBACK_CITY} (forced)"
+
+            gps_cache["last_fetch"] = now
+            gps_cache["pos_by_port"] = pos_by_port
+            gps_cache["node_lat"] = node_lat
+            gps_cache["node_lon"] = node_lon
+            gps_cache["node_src"] = f"{src_note} | {src}"
+            gps_cache["last_debug"] = "ok"
+
+        except Exception as e:
+            # ✅ Si el HTTP falla, igual caemos a Medellín y seguimos vivos
+            pos_by_port = _compute_left_right_from_avg(FALLBACK_LAT, FALLBACK_LON, heading_deg, NODE_OFFSET_M)
+            node_lat, node_lon, src = _pick_node_position_for_this_blade(
+                blade_name=blade_name,
+                pos_by_port=pos_by_port,
+                heading_deg=heading_deg,
+                offset_m=NODE_OFFSET_M,
+                node_port=node_port,
+                node_side=node_side,
+            )
+
+            gps_cache["last_fetch"] = now
+            gps_cache["pos_by_port"] = pos_by_port
+            gps_cache["node_lat"] = node_lat
+            gps_cache["node_lon"] = node_lon
+            gps_cache["node_src"] = f"http_error:{e} | fallback:{FALLBACK_CITY} | {src}"
+            gps_cache["last_debug"] = f"http_error:{e}"
+
+    refresh_gps_cache(force=True)
+
+
     print(f"[Pipeline] run_pipeline(dev_id={effective_dev_id}, name={blade_name})")
     print(f"[Pipeline] MODO: HÍBRIDO (Barrido + Verificación DOA)")
 
@@ -1315,7 +1725,7 @@ def run_pipeline(
     iteration_count = 0
 
     try:
-        sdr = _open_bladerf_from_env(effective_dev_id)
+        sdr, blade_serial = _open_bladerf_from_env(effective_dev_id)
     except Exception as e:
         print(f"[Pipeline] No se pudo abrir bladeRF ({blade_name}): {e}")
         return
@@ -1332,7 +1742,7 @@ def run_pipeline(
 
     # Config canales
     rx_ch = sdr.Channel(_bladerf.CHANNEL_RX(1))
-    rx1 = sdr.Channel(_bladerf.CHANNEL_RX(0))
+    rx1 = sdr.Channel(_bladerf.CHANNEL_RX(1)) #-----> pendiente, rx1 deja de ser RX(1)
 
     for ch in (rx1, rx_ch):
         ch.sample_rate = SDR_CONFIG["sample_rate"]
@@ -1353,6 +1763,8 @@ def run_pipeline(
     binary_history_per_freq: Dict[float, List] = defaultdict(list)
     multiclass_history_per_freq: Dict[float, List] = defaultdict(list)
 
+    # refresh_gps_cache(force=True)
+
     # ========================================
     # Función auxiliar: Ejecutar DOA en una frecuencia
     # ========================================
@@ -1362,23 +1774,25 @@ def run_pipeline(
         Returns: (doa_angle, doa_psr) o (None, None) si falla
         """
         # Configurar para dual-channel
-        rx0.enable = False
-        rx1.enable = False
-        rx_ch.enable = False
 
-        for ch in (rx0, rx1):
-            ch.frequency = int(freq_hz)
-
-        sdr.sync_config(
-            layout=_bladerf.ChannelLayout.RX_X2,
-            fmt=_bladerf.Format.SC16_Q11,
-            num_buffers=32,
-            buffer_size=16384,
-            num_transfers=16,
-            stream_timeout=3500,
-        )
-        rx0.enable = True
-        rx1.enable = True
+        time.sleep(0.2)
+        # rx0.enable = False
+        # rx1.enable = False
+        # rx_ch.enable = False
+        #
+        # for ch in (rx0, rx1):
+        #     ch.frequency = int(freq_hz)
+        #
+        # sdr.sync_config(
+        #     layout=_bladerf.ChannelLayout.RX_X2,
+        #     fmt=_bladerf.Format.SC16_Q11,
+        #     num_buffers=32,
+        #     buffer_size=16384,
+        #     num_transfers=16,
+        #     stream_timeout=3500,
+        # )
+        # rx0.enable = True
+        # rx1.enable = True
 
         spectra_acc = None
         angles_list = []
@@ -1451,12 +1865,19 @@ def run_pipeline(
             iteration_count += 1
             iteration_start = time.time()
 
+
+
+            node_lat_deg = gps_cache["node_lat"]
+            node_lon_deg = gps_cache["node_lon"]
+            node_src = gps_cache["node_src"]
+
             # ══════════════════════════════════════════════════════════════
             # FASE 1: VERIFICACIÓN DE DRONES CONOCIDOS (solo DOA)
             # ══════════════════════════════════════════════════════════════
             known_frequencies = drone_tracker.get_known_frequencies()
 
             if known_frequencies:
+                time.sleep(0.5)
                 print(f"\n[{blade_name}] ══ FASE VERIFICACIÓN ({len(known_frequencies)} drones) ══")
 
                 for freq in known_frequencies:
@@ -1472,19 +1893,38 @@ def run_pipeline(
 
                     if doa_angle is not None:
                         # DOA válido - actualizar tracker
+                        time.sleep(0.5)
                         drone_tracker.update_doa_verification(freq, doa_angle, doa_psr)
                         print(f"✅ DOA: {doa_angle:.1f}° ({time.time() - verify_start:.2f}s)")
 
                         # Publicar DOA actualizado
-                        publish_doa(doa_angle)
+                        publish_doa(
+                            doa_angle,
+                            blade_serial=blade_serial,
+                            center_freq_hz=freq,
+                            psr_db=doa_psr,
+                        )
                         publish_drone_detection(drone, blade_name)
-                    else:
-                        # DOA inválido - marcar fallo
-                        was_removed = drone_tracker.mark_verification_failed(freq)
-                        if was_removed:
-                            print(f"❌ ELIMINADO (demasiados fallos)")
-                        else:
-                            print(f"⚠️  Fallo (PSR: {doa_psr:.1f} dB)")
+
+                        tri = tri_update_and_solve(
+                            freq_hz=freq,
+                            blade_serial=blade_serial,
+                            doa_local_deg=doa_angle,
+                            node_lat=node_lat_deg,
+                            node_lon=node_lon_deg,
+                            heading_deg=fixed_heading_deg
+                        )
+                        if tri:
+                            print(
+                                f"[{blade_name}] 📍 TRIANGULACIÓN @ {freq / 1e6:.0f} MHz → lat={tri.lat_deg:.7f}, lon={tri.lon_deg:.7f}")
+                        #     # aquí ya tienes (lat, lon) del emisor
+                    # else:
+                    #     # DOA inválido - marcar fallo
+                    #     was_removed = drone_tracker.mark_verification_failed(freq)
+                    #     if was_removed:
+                    #         print(f"❌ ELIMINADO (demasiados fallos)")
+                    #     else:
+                    #         print(f"⚠️  Fallo (PSR: {doa_psr:.1f} dB)")
 
             # ══════════════════════════════════════════════════════════════
             # FASE 2: BARRIDO (descubrimiento de nuevos drones)
@@ -1638,12 +2078,31 @@ def run_pipeline(
 
                 if existing_drone is None:
                     # NUEVO DRON - ejecutar DOA completo
+
                     print(f"[{blade_name}] 🎯 NUEVO DRON en {center_freq / 1e6:.0f} MHz - Ejecutando DOA...")
                     doa_angle, doa_psr = execute_doa_at_frequency(center_freq, NUM_READS_DISCOVER)
 
                     if doa_angle is not None:
                         print(f"[{blade_name}] [DOA] Ángulo: {doa_angle:.1f}°")
-                        publish_doa(doa_angle)
+                        publish_doa(
+                            doa_angle,
+                            blade_serial=blade_serial,
+                            center_freq_hz=center_freq,
+                            psr_db=doa_psr,
+                        )
+
+                        tri = tri_update_and_solve(
+                            freq_hz=center_freq,
+                            blade_serial=blade_serial,
+                            doa_local_deg=doa_angle,
+                            node_lat=node_lat_deg,
+                            node_lon=node_lon_deg,
+                            heading_deg=fixed_heading_deg
+                        )
+                        if tri:
+                            print(
+                                f"[{blade_name}] 📍 TRIANGULACIÓN @ {freq / 1e6:.0f} MHz → lat={tri.lat_deg:.7f}, lon={tri.lon_deg:.7f}")
+                            # aquí ya tienes (lat, lon) del emisor
                     else:
                         print(f"[{blade_name}] [DOA] Sin lecturas válidas")
 
@@ -1707,7 +2166,7 @@ def run_pipeline(
             # ========================================
             # Publicar estado completo
             # ========================================
-            publish_multi_drone(drone_tracker, blade_name)
+            # publish_multi_drone(drone_tracker, blade_name)
 
             # Tiempo total de iteración
             iteration_elapsed = time.time() - iteration_start
